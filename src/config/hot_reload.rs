@@ -137,6 +137,7 @@ fn warn_non_hot_changes(old: &ProxyConfig, new: &ProxyConfig) {
             != new.general.upstream_unhealthy_fail_threshold
         || old.general.upstream_connect_failfast_hard_errors
             != new.general.upstream_connect_failfast_hard_errors
+        || old.general.rpc_proxy_req_every != new.general.rpc_proxy_req_every
     {
         warn!("config reload: general.upstream_* changed; restart required");
     }

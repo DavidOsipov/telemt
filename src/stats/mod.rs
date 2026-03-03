@@ -46,10 +46,16 @@ pub struct Stats {
     me_keepalive_failed: AtomicU64,
     me_keepalive_pong: AtomicU64,
     me_keepalive_timeout: AtomicU64,
+    me_rpc_proxy_req_signal_sent_total: AtomicU64,
+    me_rpc_proxy_req_signal_failed_total: AtomicU64,
+    me_rpc_proxy_req_signal_skipped_no_meta_total: AtomicU64,
+    me_rpc_proxy_req_signal_response_total: AtomicU64,
+    me_rpc_proxy_req_signal_close_sent_total: AtomicU64,
     me_reconnect_attempts: AtomicU64,
     me_reconnect_success: AtomicU64,
     me_handshake_reject_total: AtomicU64,
     me_reader_eof_total: AtomicU64,
+    me_idle_close_by_peer_total: AtomicU64,
     me_crc_mismatch: AtomicU64,
     me_seq_mismatch: AtomicU64,
     me_endpoint_quarantine_total: AtomicU64,
@@ -289,6 +295,36 @@ impl Stats {
             self.me_keepalive_timeout.fetch_add(value, Ordering::Relaxed);
         }
     }
+    pub fn increment_me_rpc_proxy_req_signal_sent_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_rpc_proxy_req_signal_sent_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_rpc_proxy_req_signal_failed_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_rpc_proxy_req_signal_failed_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_rpc_proxy_req_signal_skipped_no_meta_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_rpc_proxy_req_signal_skipped_no_meta_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_rpc_proxy_req_signal_response_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_rpc_proxy_req_signal_response_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_rpc_proxy_req_signal_close_sent_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_rpc_proxy_req_signal_close_sent_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
     pub fn increment_me_reconnect_attempt(&self) {
         if self.telemetry_me_allows_normal() {
             self.me_reconnect_attempts.fetch_add(1, Ordering::Relaxed);
@@ -317,6 +353,12 @@ impl Stats {
     pub fn increment_me_reader_eof_total(&self) {
         if self.telemetry_me_allows_normal() {
             self.me_reader_eof_total.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_me_idle_close_by_peer_total(&self) {
+        if self.telemetry_me_allows_normal() {
+            self.me_idle_close_by_peer_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
     pub fn increment_me_crc_mismatch(&self) {
@@ -575,6 +617,26 @@ impl Stats {
     pub fn get_me_keepalive_failed(&self) -> u64 { self.me_keepalive_failed.load(Ordering::Relaxed) }
     pub fn get_me_keepalive_pong(&self) -> u64 { self.me_keepalive_pong.load(Ordering::Relaxed) }
     pub fn get_me_keepalive_timeout(&self) -> u64 { self.me_keepalive_timeout.load(Ordering::Relaxed) }
+    pub fn get_me_rpc_proxy_req_signal_sent_total(&self) -> u64 {
+        self.me_rpc_proxy_req_signal_sent_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_rpc_proxy_req_signal_failed_total(&self) -> u64 {
+        self.me_rpc_proxy_req_signal_failed_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_rpc_proxy_req_signal_skipped_no_meta_total(&self) -> u64 {
+        self.me_rpc_proxy_req_signal_skipped_no_meta_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_rpc_proxy_req_signal_response_total(&self) -> u64 {
+        self.me_rpc_proxy_req_signal_response_total
+            .load(Ordering::Relaxed)
+    }
+    pub fn get_me_rpc_proxy_req_signal_close_sent_total(&self) -> u64 {
+        self.me_rpc_proxy_req_signal_close_sent_total
+            .load(Ordering::Relaxed)
+    }
     pub fn get_me_reconnect_attempts(&self) -> u64 { self.me_reconnect_attempts.load(Ordering::Relaxed) }
     pub fn get_me_reconnect_success(&self) -> u64 { self.me_reconnect_success.load(Ordering::Relaxed) }
     pub fn get_me_handshake_reject_total(&self) -> u64 {
@@ -582,6 +644,9 @@ impl Stats {
     }
     pub fn get_me_reader_eof_total(&self) -> u64 {
         self.me_reader_eof_total.load(Ordering::Relaxed)
+    }
+    pub fn get_me_idle_close_by_peer_total(&self) -> u64 {
+        self.me_idle_close_by_peer_total.load(Ordering::Relaxed)
     }
     pub fn get_me_crc_mismatch(&self) -> u64 { self.me_crc_mismatch.load(Ordering::Relaxed) }
     pub fn get_me_seq_mismatch(&self) -> u64 { self.me_seq_mismatch.load(Ordering::Relaxed) }

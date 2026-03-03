@@ -534,6 +534,7 @@ async fn main() -> std::result::Result<(), Box<dyn std::error::Error>> {
                     config.general.me_keepalive_interval_secs,
                     config.general.me_keepalive_jitter_secs,
                     config.general.me_keepalive_payload_random,
+                    config.general.rpc_proxy_req_every,
                     config.general.me_warmup_stagger_enabled,
                     config.general.me_warmup_step_delay_ms,
                     config.general.me_warmup_step_jitter_ms,

@@ -439,6 +439,93 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
         }
     );
 
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_rpc_proxy_req_signal_sent_total Service RPC_PROXY_REQ activity signals sent"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_rpc_proxy_req_signal_sent_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_rpc_proxy_req_signal_sent_total {}",
+        if me_allows_normal {
+            stats.get_me_rpc_proxy_req_signal_sent_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_rpc_proxy_req_signal_failed_total Service RPC_PROXY_REQ activity signal failures"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_rpc_proxy_req_signal_failed_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_rpc_proxy_req_signal_failed_total {}",
+        if me_allows_normal {
+            stats.get_me_rpc_proxy_req_signal_failed_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_rpc_proxy_req_signal_skipped_no_meta_total Service RPC_PROXY_REQ skipped due to missing writer metadata"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_rpc_proxy_req_signal_skipped_no_meta_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_rpc_proxy_req_signal_skipped_no_meta_total {}",
+        if me_allows_normal {
+            stats.get_me_rpc_proxy_req_signal_skipped_no_meta_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_rpc_proxy_req_signal_response_total Service RPC_PROXY_REQ responses observed"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_rpc_proxy_req_signal_response_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_rpc_proxy_req_signal_response_total {}",
+        if me_allows_normal {
+            stats.get_me_rpc_proxy_req_signal_response_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_rpc_proxy_req_signal_close_sent_total Service RPC_CLOSE_EXT sent after activity signals"
+    );
+    let _ = writeln!(
+        out,
+        "# TYPE telemt_me_rpc_proxy_req_signal_close_sent_total counter"
+    );
+    let _ = writeln!(
+        out,
+        "telemt_me_rpc_proxy_req_signal_close_sent_total {}",
+        if me_allows_normal {
+            stats.get_me_rpc_proxy_req_signal_close_sent_total()
+        } else {
+            0
+        }
+    );
+
     let _ = writeln!(out, "# HELP telemt_me_reconnect_attempts_total ME reconnect attempts");
     let _ = writeln!(out, "# TYPE telemt_me_reconnect_attempts_total counter");
     let _ = writeln!(
@@ -495,6 +582,21 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
         "telemt_me_reader_eof_total {}",
         if me_allows_normal {
             stats.get_me_reader_eof_total()
+        } else {
+            0
+        }
+    );
+
+    let _ = writeln!(
+        out,
+        "# HELP telemt_me_idle_close_by_peer_total ME idle writers closed by peer"
+    );
+    let _ = writeln!(out, "# TYPE telemt_me_idle_close_by_peer_total counter");
+    let _ = writeln!(
+        out,
+        "telemt_me_idle_close_by_peer_total {}",
+        if me_allows_normal {
+            stats.get_me_idle_close_by_peer_total()
         } else {
             0
         }
@@ -1225,6 +1327,12 @@ mod tests {
         stats.observe_upstream_connect_attempts_per_request(2);
         stats.observe_upstream_connect_duration_ms(220, true);
         stats.observe_upstream_connect_duration_ms(1500, false);
+        stats.increment_me_rpc_proxy_req_signal_sent_total();
+        stats.increment_me_rpc_proxy_req_signal_failed_total();
+        stats.increment_me_rpc_proxy_req_signal_skipped_no_meta_total();
+        stats.increment_me_rpc_proxy_req_signal_response_total();
+        stats.increment_me_rpc_proxy_req_signal_close_sent_total();
+        stats.increment_me_idle_close_by_peer_total();
         stats.increment_user_connects("alice");
         stats.increment_user_curr_connects("alice");
         stats.add_user_octets_from("alice", 1024);
@@ -1257,6 +1365,12 @@ mod tests {
         assert!(
             output.contains("telemt_upstream_connect_duration_fail_total{bucket=\"gt_1000ms\"} 1")
         );
+        assert!(output.contains("telemt_me_rpc_proxy_req_signal_sent_total 1"));
+        assert!(output.contains("telemt_me_rpc_proxy_req_signal_failed_total 1"));
+        assert!(output.contains("telemt_me_rpc_proxy_req_signal_skipped_no_meta_total 1"));
+        assert!(output.contains("telemt_me_rpc_proxy_req_signal_response_total 1"));
+        assert!(output.contains("telemt_me_rpc_proxy_req_signal_close_sent_total 1"));
+        assert!(output.contains("telemt_me_idle_close_by_peer_total 1"));
         assert!(output.contains("telemt_user_connections_total{user=\"alice\"} 1"));
         assert!(output.contains("telemt_user_connections_current{user=\"alice\"} 1"));
         assert!(output.contains("telemt_user_octets_from_client{user=\"alice\"} 1024"));
@@ -1291,6 +1405,8 @@ mod tests {
         assert!(output.contains("# TYPE telemt_connections_bad_total counter"));
         assert!(output.contains("# TYPE telemt_handshake_timeouts_total counter"));
         assert!(output.contains("# TYPE telemt_upstream_connect_attempt_total counter"));
+        assert!(output.contains("# TYPE telemt_me_rpc_proxy_req_signal_sent_total counter"));
+        assert!(output.contains("# TYPE telemt_me_idle_close_by_peer_total counter"));
         assert!(output.contains("# TYPE telemt_me_writer_removed_total counter"));
         assert!(output.contains(
             "# TYPE telemt_me_writer_removed_unexpected_minus_restored_total gauge"

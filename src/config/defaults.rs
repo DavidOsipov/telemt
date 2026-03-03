@@ -216,6 +216,10 @@ pub(crate) fn default_upstream_connect_failfast_hard_errors() -> bool {
     false
 }
 
+pub(crate) fn default_rpc_proxy_req_every() -> u64 {
+    0
+}
+
 pub(crate) fn default_crypto_pending_buffer() -> usize {
     256 * 1024
 }

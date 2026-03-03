@@ -162,8 +162,8 @@ impl MeBindStaleMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum MeFloorMode {
-    #[default]
     Static,
+    #[default]
     Adaptive,
 }
 
@@ -355,6 +355,11 @@ pub struct GeneralConfig {
     /// Keepalive payload randomized (4 bytes); otherwise zeros.
     #[serde(default = "default_true")]
     pub me_keepalive_payload_random: bool,
+
+    /// Interval in seconds for service RPC_PROXY_REQ activity signals to ME.
+    /// 0 disables service activity signals.
+    #[serde(default = "default_rpc_proxy_req_every")]
+    pub rpc_proxy_req_every: u64,
 
     /// Max pending ciphertext buffer per client writer (bytes).
     /// Controls FakeTLS backpressure vs throughput.
@@ -666,6 +671,7 @@ impl Default for GeneralConfig {
             me_keepalive_interval_secs: default_keepalive_interval(),
             me_keepalive_jitter_secs: default_keepalive_jitter(),
             me_keepalive_payload_random: default_true(),
+            rpc_proxy_req_every: default_rpc_proxy_req_every(),
             me_warmup_stagger_enabled: default_true(),
             me_warmup_step_delay_ms: default_warmup_step_delay_ms(),
             me_warmup_step_jitter_ms: default_warmup_step_jitter_ms(),
