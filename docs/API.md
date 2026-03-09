@@ -99,6 +99,7 @@ Notes:
 | `GET` | `/v1/runtime/me_quality` | none | `200` | `RuntimeMeQualityData` |
 | `GET` | `/v1/runtime/upstream_quality` | none | `200` | `RuntimeUpstreamQualityData` |
 | `GET` | `/v1/runtime/nat_stun` | none | `200` | `RuntimeNatStunData` |
+| `GET` | `/v1/runtime/me-selftest` | none | `200` | `RuntimeMeSelftestData` |
 | `GET` | `/v1/runtime/connections/summary` | none | `200` | `RuntimeEdgeConnectionsSummaryData` |
 | `GET` | `/v1/runtime/events/recent` | none | `200` | `RuntimeEdgeEventsData` |
 | `GET` | `/v1/stats/users` | none | `200` | `UserInfo[]` |
@@ -560,6 +561,67 @@ Note: the request contract is defined, but the corresponding route currently ret
 | `addr` | `string` | Reflected public endpoint (`ip:port`). |
 | `age_secs` | `u64` | Reflection value age in seconds. |
 
+### `RuntimeMeSelftestData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `enabled` | `bool` | Runtime payload availability. |
+| `reason` | `string?` | `source_unavailable` when ME pool is unavailable. |
+| `generated_at_epoch_secs` | `u64` | Snapshot generation timestamp. |
+| `data` | `RuntimeMeSelftestPayload?` | Null when unavailable. |
+
+#### `RuntimeMeSelftestPayload`
+| Field | Type | Description |
+| --- | --- | --- |
+| `kdf` | `RuntimeMeSelftestKdfData` | KDF EWMA health state. |
+| `timeskew` | `RuntimeMeSelftestTimeskewData` | Date-header skew health state. |
+| `ip` | `RuntimeMeSelftestIpData` | Interface IP family classification. |
+| `pid` | `RuntimeMeSelftestPidData` | Process PID marker (`one|non-one`). |
+| `bnd` | `RuntimeMeSelftestBndData` | SOCKS BND.ADDR/BND.PORT health state. |
+
+#### `RuntimeMeSelftestKdfData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `state` | `string` | `ok` or `error` based on EWMA threshold. |
+| `ewma_errors_per_min` | `f64` | EWMA KDF error rate per minute. |
+| `threshold_errors_per_min` | `f64` | Threshold used for `error` decision. |
+| `errors_total` | `u64` | Total source errors (`kdf_drift + socks_kdf_strict_reject`). |
+
+#### `RuntimeMeSelftestTimeskewData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `state` | `string` | `ok` or `error` (`max_skew_secs_15m > 60` => `error`). |
+| `max_skew_secs_15m` | `u64?` | Maximum observed skew in the last 15 minutes. |
+| `samples_15m` | `usize` | Number of skew samples in the last 15 minutes. |
+| `last_skew_secs` | `u64?` | Latest observed skew value. |
+| `last_source` | `string?` | Latest skew source marker. |
+| `last_seen_age_secs` | `u64?` | Age of the latest skew sample. |
+
+#### `RuntimeMeSelftestIpData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `v4` | `RuntimeMeSelftestIpFamilyData?` | IPv4 interface probe result; absent when unknown. |
+| `v6` | `RuntimeMeSelftestIpFamilyData?` | IPv6 interface probe result; absent when unknown. |
+
+#### `RuntimeMeSelftestIpFamilyData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `addr` | `string` | Detected interface IP. |
+| `state` | `string` | `good`, `bogon`, or `loopback`. |
+
+#### `RuntimeMeSelftestPidData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `pid` | `u32` | Current process PID. |
+| `state` | `string` | `one` when PID=1, otherwise `non-one`. |
+
+#### `RuntimeMeSelftestBndData`
+| Field | Type | Description |
+| --- | --- | --- |
+| `addr_state` | `string` | `ok`, `bogon`, or `error`. |
+| `port_state` | `string` | `ok`, `zero`, or `error`. |
+| `last_addr` | `string?` | Latest observed SOCKS BND address. |
+| `last_seen_age_secs` | `u64?` | Age of latest BND sample. |
+
 ### `RuntimeEdgeConnectionsSummaryData`
 | Field | Type | Description |
 | --- | --- | --- |
@@ -972,10 +1034,11 @@ Note: the request contract is defined, but the corresponding route currently ret
 
 Link generation uses active config and enabled modes:
 - `[general.links].public_host/public_port` have priority.
-- If `public_host` is not set, startup-detected public IPs are used when they are present in API runtime context.
-- Fallback host sources: listener `announce`, `announce_ip`, explicit listener `ip`.
-- Legacy fallback: `listen_addr_ipv4` and `listen_addr_ipv6` when routable.
-- Startup-detected IP values are process-static after API task bootstrap.
+- If `public_host` is not set, hosts are resolved from `server.listeners` in order:
+  `announce` -> `announce_ip` -> listener bind `ip`.
+- For wildcard listener IPs (`0.0.0.0` / `::`), startup-detected external IP of the same family is used when available.
+- If no host can be resolved from listeners, fallback is startup-detected `IPv4 -> IPv6`.
+- Final compatibility fallback uses `listen_addr_ipv4`/`listen_addr_ipv6` when routable, otherwise `"UNKNOWN"`.
 - User rows are sorted by `username` in ascending lexical order.
 
 ### `CreateUserResponse`
@@ -1020,6 +1083,7 @@ Additional runtime endpoint behavior:
 | `/v1/runtime/me_quality` | No | ME pool snapshot unavailable | `enabled=true`, full payload |
 | `/v1/runtime/upstream_quality` | No | Upstream runtime snapshot unavailable | `enabled=true`, full payload |
 | `/v1/runtime/nat_stun` | No | STUN shared state unavailable | `enabled=true`, full payload |
+| `/v1/runtime/me-selftest` | No | ME pool unavailable => `enabled=false`, `reason=source_unavailable` | `enabled=true`, full payload |
 | `/v1/runtime/connections/summary` | `runtime_edge_enabled=false` => `enabled=false`, `reason=feature_disabled` | Recompute lock contention with no cache entry => `enabled=true`, `reason=source_unavailable` | `enabled=true`, full payload |
 | `/v1/runtime/events/recent` | `runtime_edge_enabled=false` => `enabled=false`, `reason=feature_disabled` | Not used in current implementation | `enabled=true`, full payload |
 
