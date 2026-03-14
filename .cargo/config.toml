@@ -1,0 +1,22 @@
+# .cargo/config.toml
+#
+# Only rustc-native lints belong in rustflags.  clippy::* lints are unknown to
+# rustc and produce "unknown lint" warnings on every cargo build/check/test
+# invocation, which silently defeats the enforcement intent and will break any
+# job that sets -D warnings.  All clippy lints must be configured exclusively
+# via `cargo clippy` in the CI workflow (see .github/workflows/security.yml).
+[build]
+rustflags = [
+    # Forbid unsafe code globally; this is a rustc-native lint.
+    "-D", "unsafe_code",
+
+    # Native compiler strictness.
+    #"-D", "missing_docs",
+    #"-D", "missing_debug_implementations",
+    "-D", "trivial_casts",
+    "-D", "trivial_numeric_casts",
+    "-D", "unused_extern_crates",
+    "-D", "unused_import_braces",
+    #"-D", "unused_qualifications",
+    "-D", "rust_2018_idioms",
+]
