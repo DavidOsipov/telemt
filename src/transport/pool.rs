@@ -260,23 +260,44 @@ pub struct PoolStats {
 #[cfg(unix)]
 #[allow(unsafe_code)]
 fn is_connection_alive(stream: &TcpStream) -> bool {
+    use std::io::ErrorKind;
     use std::os::unix::io::AsRawFd;
+
+    let fd = stream.as_raw_fd();
     let mut buf = [0u8; 1];
-    // SAFETY: `stream` owns this fd for the full duration of the call.
-    // MSG_PEEK + MSG_DONTWAIT: inspect the receive buffer without consuming bytes.
-    let n = unsafe {
-        libc::recv(
-            stream.as_raw_fd(),
-            buf.as_mut_ptr().cast::<libc::c_void>(),
-            1,
-            libc::MSG_PEEK | libc::MSG_DONTWAIT,
-        )
-    };
-    match n {
-        0 => false,
-        n if n > 0 => true,
-        _ => std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock,
+
+    // EINTR can fire on any syscall when a signal is delivered to the thread.
+    // Treating it as a dead connection causes spurious reconnects; retry instead.
+    const MAX_RECV_RETRIES: usize = 3;
+
+    for _ in 0..MAX_RECV_RETRIES {
+        // SAFETY: `stream` owns this fd for the full duration of the call.
+        // MSG_PEEK + MSG_DONTWAIT: inspect the receive buffer without consuming bytes.
+        let n = unsafe {
+            libc::recv(
+                fd,
+                buf.as_mut_ptr().cast::<libc::c_void>(),
+                1,
+                libc::MSG_PEEK | libc::MSG_DONTWAIT,
+            )
+        };
+
+        if n > 0 {
+            return true;
+        } else if n == 0 {
+            return false;
+        } else {
+            match std::io::Error::last_os_error().kind() {
+                ErrorKind::Interrupted => continue,
+                ErrorKind::WouldBlock => return true,
+                _ => return false,
+            }
+        }
     }
+
+    // After MAX_RECV_RETRIES consecutive EINTR, assume the connection is alive
+    // rather than triggering a false reconnect.
+    true
 }
 
 #[cfg(not(unix))]
@@ -518,5 +539,63 @@ mod tests {
             assert!(is_connection_alive(&stream));
         }
     }
-}
 
+    // ── EINTR retry-logic unit tests ──────────────────────────────────────────
+
+    // The non-unix fallback path must correctly classify WouldBlock as alive
+    // and any other error as dead, mirroring the unix semantics.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn test_is_connection_alive_non_unix_open_connection() {
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("bind failed: {e}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = listener.accept().await;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        });
+        let stream = match TcpStream::connect(addr).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("connect failed: {e}"),
+        };
+        assert!(is_connection_alive(&stream), "open idle connection must be alive (non-unix)");
+    }
+
+    // Verify the unix path: calling is_connection_alive many times on an active
+    // connection never spuriously returns false (guards against the pre-fix bug
+    // where EINTR would flip the result on a single call).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn test_is_connection_alive_never_returns_false_spuriously_on_open_connection() {
+        use tokio::io::AsyncWriteExt;
+        let listener = match TcpListener::bind("127.0.0.1:0").await {
+            Ok(l) => l,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("bind failed: {e}"),
+        };
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut s, _) = listener.accept().await.expect("accept");
+            s.write_all(&[0xBEu8]).await.expect("write");
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        });
+        let stream = match TcpStream::connect(addr).await {
+            Ok(s) => s,
+            Err(e) if e.kind() == ErrorKind::PermissionDenied => return,
+            Err(e) => panic!("connect failed: {e}"),
+        };
+        tokio::time::sleep(Duration::from_millis(30)).await;
+        // Call is_connection_alive 20 times; all must return true.
+        for i in 0..20 {
+            assert!(
+                is_connection_alive(&stream),
+                "is_connection_alive must be true on call {i} (connection is open with buffered data)"
+            );
+        }
+        drop(server);
+    }
+}

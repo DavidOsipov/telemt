@@ -1,8 +1,9 @@
 #![allow(deprecated)]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use rand::Rng;
 use tracing::warn;
@@ -13,6 +14,8 @@ use crate::error::{ProxyError, Result};
 use super::defaults::*;
 use super::types::*;
 
+// Reject absolute paths and any path component that traverses upward.
+// This prevents config include directives from escaping the config directory.
 fn is_safe_include_path(path_str: &str) -> bool {
     let p = std::path::Path::new(path_str);
     if p.is_absolute() {
@@ -21,7 +24,37 @@ fn is_safe_include_path(path_str: &str) -> bool {
     !p.components().any(|c| matches!(c, std::path::Component::ParentDir))
 }
 
-fn preprocess_includes(content: &str, base_dir: &Path, depth: u8) -> Result<String> {
+#[derive(Debug, Clone)]
+pub(crate) struct LoadedConfig {
+    pub(crate) config: ProxyConfig,
+    pub(crate) source_files: Vec<PathBuf>,
+    pub(crate) rendered_hash: u64,
+}
+
+fn normalize_config_path(path: &Path) -> PathBuf {
+    path.canonicalize().unwrap_or_else(|_| {
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(path))
+                .unwrap_or_else(|_| path.to_path_buf())
+        }
+    })
+}
+
+fn hash_rendered_snapshot(rendered: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    rendered.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn preprocess_includes(
+    content: &str,
+    base_dir: &Path,
+    depth: u8,
+    source_files: &mut BTreeSet<PathBuf>,
+) -> Result<String> {
     if depth > 10 {
         return Err(ProxyError::Config("Include depth > 10".into()));
     }
@@ -39,10 +72,16 @@ fn preprocess_includes(content: &str, base_dir: &Path, depth: u8) -> Result<Stri
                     )));
                 }
                 let resolved = base_dir.join(path_str);
+                source_files.insert(normalize_config_path(&resolved));
                 let included = std::fs::read_to_string(&resolved)
                     .map_err(|e| ProxyError::Config(e.to_string()))?;
                 let included_dir = resolved.parent().unwrap_or(base_dir);
-                output.push_str(&preprocess_includes(&included, included_dir, depth + 1)?);
+                output.push_str(&preprocess_includes(
+                    &included,
+                    included_dir,
+                    depth + 1,
+                    source_files,
+                )?);
                 output.push('\n');
                 continue;
             }
@@ -152,13 +191,16 @@ pub struct ProxyConfig {
 
 impl ProxyConfig {
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self> {
-        let content =
-            std::fs::read_to_string(&path).map_err(|e| ProxyError::Config(e.to_string()))?;
-        let base_dir = path
-            .as_ref()
-            .parent()
-            .unwrap_or_else(|| Path::new("."));
-        let processed = preprocess_includes(&content, base_dir, 0)?;
+        Self::load_with_metadata(path).map(|loaded| loaded.config)
+    }
+
+    pub(crate) fn load_with_metadata<P: AsRef<Path>>(path: P) -> Result<LoadedConfig> {
+        let path = path.as_ref();
+        let content = std::fs::read_to_string(path).map_err(|e| ProxyError::Config(e.to_string()))?;
+        let base_dir = path.parent().unwrap_or(Path::new("."));
+        let mut source_files = BTreeSet::new();
+        source_files.insert(normalize_config_path(path));
+        let processed = preprocess_includes(&content, base_dir, 0, &mut source_files)?;
 
         let parsed_toml: toml::Value =
             toml::from_str(&processed).map_err(|e| ProxyError::Config(e.to_string()))?;
@@ -821,7 +863,11 @@ impl ProxyConfig {
             .entry("203".to_string())
             .or_insert_with(|| vec!["91.105.192.100:443".to_string()]);
 
-        Ok(config)
+        Ok(LoadedConfig {
+            config,
+            source_files: source_files.into_iter().collect(),
+            rendered_hash: hash_rendered_snapshot(&processed),
+        })
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -1163,6 +1209,48 @@ mod tests {
             cfg.dc_overrides["202"],
             vec!["149.154.167.51:443", "149.154.175.100:443"]
         );
+    }
+
+    #[test]
+    fn load_with_metadata_collects_include_files() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("telemt_load_metadata_{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let main_path = dir.join("config.toml");
+        let include_path = dir.join("included.toml");
+
+        std::fs::write(
+            &include_path,
+            r#"
+                [access.users]
+                user = "00000000000000000000000000000000"
+            "#,
+        )
+        .unwrap();
+        std::fs::write(
+            &main_path,
+            r#"
+                include = "included.toml"
+
+                [censorship]
+                tls_domain = "example.com"
+            "#,
+        )
+        .unwrap();
+
+        let loaded = ProxyConfig::load_with_metadata(&main_path).unwrap();
+        let main_normalized = normalize_config_path(&main_path);
+        let include_normalized = normalize_config_path(&include_path);
+
+        assert!(loaded.source_files.contains(&main_normalized));
+        assert!(loaded.source_files.contains(&include_normalized));
+
+        let _ = std::fs::remove_file(main_path);
+        let _ = std::fs::remove_file(include_path);
+        let _ = std::fs::remove_dir(dir);
     }
 
     #[test]
@@ -2197,7 +2285,8 @@ mod tests {
 
         let root = dir.join(format!("{prefix}0.toml"));
         let root_content = std::fs::read_to_string(&root).unwrap();
-        let result = preprocess_includes(&root_content, &dir, 0);
+        let mut sf = BTreeSet::new();
+        let result = preprocess_includes(&root_content, &dir, 0, &mut sf);
 
         for i in 0usize..=11 {
             let _ = std::fs::remove_file(dir.join(format!("{prefix}{i}.toml")));
@@ -2230,7 +2319,8 @@ mod tests {
 
         let root = dir.join(format!("{prefix}0.toml"));
         let root_content = std::fs::read_to_string(&root).unwrap();
-        let result = preprocess_includes(&root_content, &dir, 0);
+        let mut sf = BTreeSet::new();
+        let result = preprocess_includes(&root_content, &dir, 0, &mut sf);
 
         for i in 0usize..=10 {
             let _ = std::fs::remove_file(dir.join(format!("{prefix}{i}.toml")));

@@ -62,7 +62,7 @@ use runtime_zero::{
 use runtime_watch::spawn_runtime_watchers;
 use users::{create_user, delete_user, patch_user, rotate_secret, users_from_config};
 
-pub struct ApiRuntimeState {
+pub(super) struct ApiRuntimeState {
     pub(super) process_started_at_epoch_secs: u64,
     pub(super) config_reload_count: AtomicU64,
     pub(super) last_config_reload_epoch_secs: AtomicU64,
@@ -70,7 +70,7 @@ pub struct ApiRuntimeState {
 }
 
 #[derive(Clone)]
-pub struct ApiShared {
+pub(super) struct ApiShared {
     pub(super) stats: Arc<Stats>,
     pub(super) ip_tracker: Arc<UserIpTracker>,
     pub(super) me_pool: Arc<RwLock<Option<Arc<MePool>>>>,
@@ -565,18 +565,19 @@ async fn handle(
     }
 }
 
-// XOR-fold constant-time comparison: avoids early return on length mismatch to
-// prevent a timing oracle that would reveal the expected token length to a remote
-// attacker (OWASP ASVS V6.6.1). Bitwise `&` on bool is eager — it never
-// short-circuits — so both the length check and the byte fold always execute.
+// XOR-fold constant-time comparison. Running time depends only on the length of the
+// expected token (b), not on min(a.len(), b.len()), to prevent a timing oracle where
+// an attacker reduces the iteration count by sending a shorter candidate
+// (OWASP ASVS V6.6.1). Bitwise `&` on bool is eager — it never short-circuits —
+// so both the length check and the byte fold always execute.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    let length_ok = a.len() == b.len();
-    let min_len = a.len().min(b.len());
-    let byte_mismatch = a[..min_len]
-        .iter()
-        .zip(b[..min_len].iter())
-        .fold(0u8, |acc, (x, y)| acc | (x ^ y));
-    length_ok & (byte_mismatch == 0)
+    let mut diff = 0u8;
+    for i in 0..b.len() {
+        let x = a.get(i).copied().unwrap_or(0);
+        let y = b[i];
+        diff |= x ^ y;
+    }
+    (a.len() == b.len()) & (diff == 0)
 }
 
 #[cfg(test)]
@@ -764,5 +765,107 @@ mod tests {
         assert!(!constant_time_eq(&a, &c));
         c[0] = 0xde;
         assert!(!constant_time_eq(&a, &c));
+    }
+
+    // ── Timing-oracle adversarial tests (length-iteration invariant) ──────────
+
+    // An active censor/attacker who knows the token format may send truncated
+    // inputs to narrow down the token length via a timing side-channel.
+    // After the fix, `constant_time_eq` always iterates over `b.len()` (the
+    // expected token length), so submission of every strict prefix of the
+    // expected token must be rejected while iteration count stays constant.
+    #[test]
+    fn constant_time_eq_every_prefix_of_expected_token_is_rejected() {
+        let expected = b"Bearer super-secret-api-token-abc123xyz";
+        for prefix_len in 0..expected.len() {
+            let attacker_input = &expected[..prefix_len];
+            assert!(
+                !constant_time_eq(attacker_input, expected),
+                "prefix of length {prefix_len} must not authenticate against full token"
+            );
+        }
+    }
+
+    // Reversed: input longer than expected token — the extra bytes must cause
+    // rejection even when the first b.len() bytes are correct.
+    #[test]
+    fn constant_time_eq_input_with_correct_prefix_plus_extra_bytes_is_rejected() {
+        let expected = b"secret-token";
+        for extra in 1usize..=32 {
+            let mut longer = expected.to_vec();
+            // Extend with zeros — the XOR of matching first bytes is 0, so only
+            // the length check prevents a false positive.
+            longer.extend(std::iter::repeat(0u8).take(extra));
+            assert!(
+                !constant_time_eq(&longer, expected),
+                "input extended by {extra} zero bytes must not authenticate"
+            );
+            // Extend with matching-value bytes — ensures the byte_fold stays at 0
+            // for the expected-length portion; only length differs.
+            let mut same_byte_extension = expected.to_vec();
+            same_byte_extension.extend(std::iter::repeat(expected[0]).take(extra));
+            assert!(
+                !constant_time_eq(&same_byte_extension, expected),
+                "input extended by {extra} repeated bytes must not authenticate"
+            );
+        }
+    }
+
+    // Null-byte injection: ensure the function does not mis-parse embedded
+    // NUL characters as C-string terminators and accept a shorter match.
+    #[test]
+    fn constant_time_eq_null_byte_injection_is_rejected() {
+        // Token containing a null byte — must only match itself exactly.
+        let expected: &[u8] = b"token\x00suffix";
+        assert!(constant_time_eq(expected, expected));
+        assert!(!constant_time_eq(b"token", expected));
+        assert!(!constant_time_eq(b"token\x00", expected));
+        assert!(!constant_time_eq(b"token\x00suffi", expected));
+
+        // Null-prefixed input of the same length must not match a non-null token.
+        let real_token: &[u8] = b"real-secret-value";
+        let mut null_injected = vec![0u8; real_token.len()];
+        null_injected[0] = real_token[0];
+        assert!(!constant_time_eq(&null_injected, real_token));
+    }
+
+    // High-byte (0xFF) values throughout: XOR of 0xFF ^ 0xFF = 0, so equal
+    // high-byte slices must match, and any single-byte difference must not.
+    #[test]
+    fn constant_time_eq_high_byte_edge_cases() {
+        let token = vec![0xffu8; 20];
+        assert!(constant_time_eq(&token, &token));
+        let mut tampered = token.clone();
+        tampered[10] = 0xfe;
+        assert!(!constant_time_eq(&tampered, &token));
+        // Shorter all-ff slice must not match.
+        assert!(!constant_time_eq(&token[..19], &token));
+    }
+
+    // Accumulator-saturation attack: if all bytes of `a` have been XOR-folded to
+    // 0xFF (i.e. acc is saturated), but the remaining bytes of `b` are 0x00, the
+    // fold of 0x00 into 0xFF must keep acc ≠ 0 (since 0xFF | 0 = 0xFF).
+    // This guards against a misimplemented fold that resets acc on certain values.
+    #[test]
+    fn constant_time_eq_accumulator_never_resets_to_zero_after_mismatch() {
+        // a[0] = 0xAA, b[0] = 0x55 → XOR = 0xFF.
+        // Subsequent bytes all match (XOR = 0x00). Accumulator must remain 0xFF.
+        let mut a = vec![0x55u8; 16];
+        let mut b = vec![0x55u8; 16];
+        a[0] = 0xAA; // deliberate mismatch at position 0
+        assert!(!constant_time_eq(&a, &b));
+        // Verify with mismatch only at last position to test late detection.
+        a[0] = b[0];
+        a[15] = 0xAA;
+        b[15] = 0x55;
+        assert!(!constant_time_eq(&a, &b));
+    }
+
+    // Zero-length expected token: only the empty input must match.
+    #[test]
+    fn constant_time_eq_zero_length_expected_only_matches_empty_input() {
+        assert!(constant_time_eq(b"", b""));
+        assert!(!constant_time_eq(b"\x00", b""));
+        assert!(!constant_time_eq(b"x", b""));
     }
 }
