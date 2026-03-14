@@ -1,7 +1,7 @@
 use std::time::SystemTime;
 use serde::{Serialize, Deserialize};
 
-/// Parsed representation of an unencrypted TLS ServerHello.
+/// Parsed representation of an unencrypted TLS `ServerHello`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ParsedServerHello {
     pub version: [u8; 2],
@@ -32,7 +32,7 @@ pub struct ParsedCertificateInfo {
 /// TLS certificate payload captured from profiled upstream.
 ///
 /// `certificate_message` stores an encoded TLS 1.3 Certificate handshake
-/// message body that can be replayed as opaque ApplicationData bytes in FakeTLS.
+/// message body that can be replayed as opaque `ApplicationData` bytes in `FakeTLS`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TlsCertPayload {
     pub cert_chain_der: Vec<Vec<u8>>,

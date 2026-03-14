@@ -1,0 +1,40 @@
+{
+  "database": {
+    "advisory-count": 1,
+    "last-commit": null,
+    "last-updated": null
+  },
+  "lockfile": {
+    "dependency-count": 1
+  },
+  "settings": {
+    "target_arch": [],
+    "target_os": [],
+    "severity": "high",
+    "ignore": [],
+    "informational_warnings": []
+  },
+  "vulnerabilities": {
+    "found": true,
+    "count": 1,
+    "list": [
+      {
+        "advisory": {
+          "id": "RUSTSEC-2099-0001",
+          "package": "demo-crate",
+          "title": "Low severity test advisory",
+          "severity": "low",
+          "cvss": {
+            "score": 3.1,
+            "severity": "low"
+          }
+        },
+        "package": {
+          "name": "demo-crate",
+          "version": "0.1.0"
+        }
+      }
+    ]
+  },
+  "warnings": {}
+}

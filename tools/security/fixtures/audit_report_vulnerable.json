@@ -1,0 +1,40 @@
+{
+  "database": {
+    "advisory-count": 1,
+    "last-commit": null,
+    "last-updated": null
+  },
+  "lockfile": {
+    "dependency-count": 1
+  },
+  "settings": {
+    "target_arch": [],
+    "target_os": [],
+    "severity": "high",
+    "ignore": [],
+    "informational_warnings": []
+  },
+  "vulnerabilities": {
+    "found": true,
+    "count": 1,
+    "list": [
+      {
+        "advisory": {
+          "id": "RUSTSEC-2026-0037",
+          "package": "quinn-proto",
+          "title": "Denial of service in Quinn endpoints",
+          "severity": "high",
+          "cvss": {
+            "score": 8.7,
+            "severity": "high"
+          }
+        },
+        "package": {
+          "name": "quinn-proto",
+          "version": "0.11.13"
+        }
+      }
+    ]
+  },
+  "warnings": {}
+}

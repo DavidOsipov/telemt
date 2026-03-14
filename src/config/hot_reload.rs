@@ -1,5 +1,5 @@
-//! Hot-reload: watches the config file via inotify (Linux) / FSEvents (macOS)
-//! / ReadDirectoryChangesW (Windows) using the `notify` crate.
+//! Hot-reload: watches the config file via inotify (Linux) / `FSEvents` (macOS)
+//! / `ReadDirectoryChangesW` (Windows) using the `notify` crate.
 //! SIGHUP is also supported on Unix as an additional manual trigger.
 //!
 //! # What can be reloaded without restart
@@ -503,6 +503,16 @@ fn warn_non_hot_changes(old: &ProxyConfig, new: &ProxyConfig, non_hot_changed: b
         warned = true;
         warn!("config reload: general.me_init_retry_attempts changed; restart required");
     }
+    if old.general.me_init_retry_backoff_base_ms != new.general.me_init_retry_backoff_base_ms
+        || old.general.me_init_retry_backoff_cap_ms != new.general.me_init_retry_backoff_cap_ms
+    {
+        warned = true;
+        warn!("config reload: general.me_init_retry_backoff_* changed; restart required");
+    }
+    if old.server.max_connections != new.server.max_connections {
+        warned = true;
+        warn!("config reload: server.max_connections changed; restart required");
+    }
     if old.general.me2dc_fallback != new.general.me2dc_fallback {
         warned = true;
         warn!("config reload: general.me2dc_fallback changed; restart required");
@@ -565,7 +575,7 @@ fn resolve_link_host(
         })
 }
 
-/// Print TG proxy links for a single user — mirrors print_proxy_links() in main.rs.
+/// Print TG proxy links for a single user — mirrors `print_proxy_links()` in main.rs.
 fn print_user_links(user: &str, secret: &str, host: &str, port: u16, cfg: &ProxyConfig) {
     info!(target: "telemt::links", "--- New user: {} ---", user);
     if cfg.general.modes.classic {
@@ -1044,10 +1054,9 @@ pub fn spawn_config_watcher(
     let (notify_tx, mut notify_rx) = mpsc::channel::<()>(4);
 
     // Canonicalize so path matches what notify returns (absolute) in events.
-    let config_path = match config_path.canonicalize() {
-        Ok(p) => p,
-        Err(_) => config_path.to_path_buf(),
-    };
+    let config_path = config_path
+        .canonicalize()
+        .unwrap_or_else(|_| config_path.to_path_buf());
 
     // Watch the parent directory rather than the file itself, because many
     // editors (vim, nano) and systemd write via rename, which would cause
@@ -1084,7 +1093,7 @@ pub fn spawn_config_watcher(
     // a container. PollWatcher compares file contents every 3 s and fires
     // on any change regardless of the underlying fs.
     let config_file2 = config_path.clone();
-    let tx_poll      = notify_tx.clone();
+    let tx_poll      = notify_tx;
     match notify::poll::PollWatcher::new(
         move |res: notify::Result<notify::Event>| {
             let Ok(event) = res else { return };
@@ -1116,19 +1125,29 @@ pub fn spawn_config_watcher(
     tokio::spawn(async move {
         #[cfg(unix)]
         let mut sighup = {
-            use tokio::signal::unix::{SignalKind, signal};
-            signal(SignalKind::hangup()).expect("Failed to register SIGHUP handler")
+            use tokio::signal::unix::{signal, SignalKind};
+            match signal(SignalKind::hangup()) {
+                Ok(sig) => Some(sig),
+                Err(err) => {
+                    warn!(error = %err, "Failed to register SIGHUP handler; relying on filesystem watcher");
+                    None
+                }
+            }
         };
 
         loop {
             #[cfg(unix)]
-            tokio::select! {
-                msg = notify_rx.recv() => {
-                    if msg.is_none() { break; }
+            if let Some(signal_stream) = sighup.as_mut() {
+                tokio::select! {
+                    msg = notify_rx.recv() => {
+                        if msg.is_none() { break; }
+                    }
+                    _ = signal_stream.recv() => {
+                        info!("SIGHUP received — reloading {:?}", config_path);
+                    }
                 }
-                _ = sighup.recv() => {
-                    info!("SIGHUP received — reloading {:?}", config_path);
-                }
+            } else if notify_rx.recv().await.is_none() {
+                break;
             }
             #[cfg(not(unix))]
             if notify_rx.recv().await.is_none() { break; }

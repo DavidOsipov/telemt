@@ -1,0 +1,40 @@
+{
+  "database": {
+    "advisory-count": 1,
+    "last-commit": null,
+    "last-updated": null
+  },
+  "lockfile": {
+    "dependency-count": 1
+  },
+  "settings": {
+    "target_arch": [],
+    "target_os": [],
+    "severity": "medium",
+    "ignore": [],
+    "informational_warnings": []
+  },
+  "vulnerabilities": {
+    "found": true,
+    "count": 1,
+    "list": [
+      {
+        "advisory": {
+          "id": "RUSTSEC-2099-0002",
+          "package": "demo-crate-medium",
+          "title": "Medium severity test advisory",
+          "severity": "medium",
+          "cvss": {
+            "score": 5.8,
+            "severity": "medium"
+          }
+        },
+        "package": {
+          "name": "demo-crate-medium",
+          "version": "0.2.0"
+        }
+      }
+    ]
+  },
+  "warnings": {}
+}

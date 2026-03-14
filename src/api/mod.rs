@@ -62,7 +62,7 @@ use runtime_zero::{
 use runtime_watch::spawn_runtime_watchers;
 use users::{create_user, delete_user, patch_user, rotate_secret, users_from_config};
 
-pub(super) struct ApiRuntimeState {
+pub struct ApiRuntimeState {
     pub(super) process_started_at_epoch_secs: u64,
     pub(super) config_reload_count: AtomicU64,
     pub(super) last_config_reload_epoch_secs: AtomicU64,
@@ -70,7 +70,7 @@ pub(super) struct ApiRuntimeState {
 }
 
 #[derive(Clone)]
-pub(super) struct ApiShared {
+pub struct ApiShared {
     pub(super) stats: Arc<Stats>,
     pub(super) ip_tracker: Arc<UserIpTracker>,
     pub(super) me_pool: Arc<RwLock<Option<Arc<MePool>>>>,
@@ -225,7 +225,7 @@ async fn handle(
             .headers()
             .get(AUTHORIZATION)
             .and_then(|v| v.to_str().ok())
-            .map(|v| v == api_cfg.auth_header)
+            .map(|v| constant_time_eq(v.as_bytes(), api_cfg.auth_header.as_bytes()))
             .unwrap_or(false);
         if !auth_ok {
             return Ok(error_response(
@@ -399,10 +399,64 @@ async fn handle(
                 Ok(success_response(StatusCode::CREATED, data, revision))
             }
             _ => {
-                if let Some(user) = path.strip_prefix("/v1/users/")
-                    && !user.is_empty()
-                    && !user.contains('/')
+                if let Some(user_path) = path.strip_prefix("/v1/users/")
+                    && !user_path.is_empty()
                 {
+                    // Two-segment action route: POST /v1/users/{username}/rotate-secret.
+                    // Must be resolved before the single-segment guard below because the
+                    // path segment contains a '/' that would otherwise be rejected.
+                    if method == Method::POST
+                        && let Some(base_user) = user_path.strip_suffix("/rotate-secret")
+                        && !base_user.is_empty()
+                        && !base_user.contains('/')
+                    {
+                        if api_cfg.read_only {
+                            return Ok(error_response(
+                                request_id,
+                                ApiFailure::new(
+                                    StatusCode::FORBIDDEN,
+                                    "read_only",
+                                    "API runs in read-only mode",
+                                ),
+                            ));
+                        }
+                        let expected_revision = parse_if_match(req.headers());
+                        let body =
+                            read_optional_json::<RotateSecretRequest>(req.into_body(), body_limit)
+                                .await?;
+                        let result = rotate_secret(
+                            base_user,
+                            body.unwrap_or_default(),
+                            expected_revision,
+                            &shared,
+                        )
+                        .await;
+                        let (data, revision) = match result {
+                            Ok(ok) => ok,
+                            Err(error) => {
+                                shared.runtime_events.record(
+                                    "api.user.rotate_secret.failed",
+                                    format!("username={} code={}", base_user, error.code),
+                                );
+                                return Err(error);
+                            }
+                        };
+                        shared.runtime_events.record(
+                            "api.user.rotate_secret.ok",
+                            format!("username={}", base_user),
+                        );
+                        return Ok(success_response(StatusCode::OK, data, revision));
+                    }
+
+                    // Single-segment routes: /v1/users/{username}
+                    if user_path.contains('/') {
+                        return Ok(error_response(
+                            request_id,
+                            ApiFailure::new(StatusCode::NOT_FOUND, "not_found", "Route not found"),
+                        ));
+                    }
+                    let user = user_path;
+
                     if method == Method::GET {
                         let revision = current_revision(&shared.config_path).await?;
                         let (detected_ip_v4, detected_ip_v6) = shared.detected_link_ips();
@@ -481,48 +535,6 @@ async fn handle(
                         );
                         return Ok(success_response(StatusCode::OK, deleted_user, revision));
                     }
-                    if method == Method::POST
-                        && let Some(base_user) = user.strip_suffix("/rotate-secret")
-                        && !base_user.is_empty()
-                        && !base_user.contains('/')
-                    {
-                        if api_cfg.read_only {
-                            return Ok(error_response(
-                                request_id,
-                                ApiFailure::new(
-                                    StatusCode::FORBIDDEN,
-                                    "read_only",
-                                    "API runs in read-only mode",
-                                ),
-                            ));
-                        }
-                        let expected_revision = parse_if_match(req.headers());
-                        let body =
-                            read_optional_json::<RotateSecretRequest>(req.into_body(), body_limit)
-                                .await?;
-                        let result = rotate_secret(
-                            base_user,
-                            body.unwrap_or_default(),
-                            expected_revision,
-                            &shared,
-                        )
-                        .await;
-                        let (data, revision) = match result {
-                            Ok(ok) => ok,
-                            Err(error) => {
-                                shared.runtime_events.record(
-                                    "api.user.rotate_secret.failed",
-                                    format!("username={} code={}", base_user, error.code),
-                                );
-                                return Err(error);
-                            }
-                        };
-                        shared.runtime_events.record(
-                            "api.user.rotate_secret.ok",
-                            format!("username={}", base_user),
-                        );
-                        return Ok(success_response(StatusCode::OK, data, revision));
-                    }
                     if method == Method::POST {
                         return Ok(error_response(
                             request_id,
@@ -550,5 +562,207 @@ async fn handle(
     match result {
         Ok(resp) => Ok(resp),
         Err(error) => Ok(error_response(request_id, error)),
+    }
+}
+
+// XOR-fold constant-time comparison: avoids early return on length mismatch to
+// prevent a timing oracle that would reveal the expected token length to a remote
+// attacker (OWASP ASVS V6.6.1). Bitwise `&` on bool is eager — it never
+// short-circuits — so both the length check and the byte fold always execute.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    let length_ok = a.len() == b.len();
+    let min_len = a.len().min(b.len());
+    let byte_mismatch = a[..min_len]
+        .iter()
+        .zip(b[..min_len].iter())
+        .fold(0u8, |acc, (x, y)| acc | (x ^ y));
+    length_ok & (byte_mismatch == 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::constant_time_eq;
+
+    #[test]
+    fn constant_time_eq_identical_slices_returns_true() {
+        assert!(constant_time_eq(b"token-abc", b"token-abc"));
+    }
+
+    #[test]
+    fn constant_time_eq_different_slices_same_length_returns_false() {
+        assert!(!constant_time_eq(b"token-abc", b"token-xyz"));
+    }
+
+    #[test]
+    fn constant_time_eq_different_lengths_returns_false() {
+        assert!(!constant_time_eq(b"short", b"longer-value"));
+        assert!(!constant_time_eq(b"longer-value", b"short"));
+    }
+
+    #[test]
+    fn constant_time_eq_empty_slices_returns_true() {
+        assert!(constant_time_eq(b"", b""));
+    }
+
+    #[test]
+    fn constant_time_eq_one_empty_returns_false() {
+        assert!(!constant_time_eq(b"", b"x"));
+        assert!(!constant_time_eq(b"x", b""));
+    }
+
+    #[test]
+    fn constant_time_eq_single_byte_difference_returns_false() {
+        assert!(!constant_time_eq(b"aaaaaaaaaa", b"aaaaaaaaab"));
+    }
+
+    // Verifies that the implementation does not take an early exit when lengths
+    // differ, which would expose a timing oracle revealing the expected token
+    // length (OWASP ASVS V6.6.1). The byte fold must execute over the
+    // overlapping prefix even when lengths are unequal.
+    #[test]
+    fn constant_time_eq_matching_prefix_with_length_mismatch_returns_false() {
+        // b is a strict prefix of a: all overlapping bytes are identical.
+        assert!(!constant_time_eq(b"abcdef", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abcdef"));
+        // Single extra byte appended.
+        assert!(!constant_time_eq(b"token", b"tokenX"));
+        assert!(!constant_time_eq(b"tokenX", b"token"));
+        // All-same bytes, different lengths.
+        assert!(!constant_time_eq(b"aaaa", b"aaa"));
+        assert!(!constant_time_eq(b"aaa", b"aaaa"));
+    }
+
+    // Regression test: this documents the routing bug where the outer
+    // !user.contains('/') guard blocked the rotate-secret route entirely.
+    // The fixed routing resolves the two-segment action route BEFORE applying
+    // the single-segment guard.
+    #[test]
+    fn rotate_secret_path_is_reachable_with_fixed_routing_logic() {
+        let path = "/v1/users/alice/rotate-secret";
+        let user_path = path.strip_prefix("/v1/users/").unwrap();
+
+        // Old (buggy) guard — would have rejected this path before rotate-secret
+        // could be matched because the path segment contains '/'.
+        let old_guard_passed = !user_path.is_empty() && !user_path.contains('/');
+        assert!(
+            !old_guard_passed,
+            "old guard must have been blocking the rotate-secret route"
+        );
+
+        // Fixed routing: try the two-segment action prefix FIRST.
+        let base_user = user_path
+            .strip_suffix("/rotate-secret")
+            .filter(|u| !u.is_empty() && !u.contains('/'));
+        assert_eq!(
+            base_user,
+            Some("alice"),
+            "fixed routing must extract the base username correctly"
+        );
+    }
+
+    #[test]
+    fn single_segment_user_path_routes_correctly_after_fix() {
+        let path = "/v1/users/alice";
+        let user_path = path.strip_prefix("/v1/users/").unwrap();
+
+        // rotate-secret check must not match
+        let is_rotate = user_path
+            .strip_suffix("/rotate-secret")
+            .map(|u| !u.is_empty() && !u.contains('/'))
+            .unwrap_or(false);
+        assert!(!is_rotate);
+
+        // Single-segment guard must pass
+        assert!(!user_path.contains('/'));
+        assert_eq!(user_path, "alice");
+    }
+
+    #[test]
+    fn deep_path_segment_is_rejected_by_both_guards() {
+        let path = "/v1/users/alice/settings/extra";
+        let user_path = path.strip_prefix("/v1/users/").unwrap();
+
+        // Not a rotate-secret path
+        let is_rotate = user_path
+            .strip_suffix("/rotate-secret")
+            .map(|u| !u.is_empty() && !u.contains('/'))
+            .unwrap_or(false);
+        assert!(!is_rotate);
+
+        // Not a single-segment path
+        assert!(user_path.contains('/'));
+    }
+
+    #[test]
+    fn empty_user_segment_is_rejected() {
+        let path = "/v1/users/";
+        let user_path = path.strip_prefix("/v1/users/").unwrap();
+        assert!(user_path.is_empty());
+    }
+
+    // ── constant_time_eq adversarial edge cases ───────────────────────────────
+
+    // All-zero bytes: both slices equal, accumulator stays 0 throughout.
+    #[test]
+    fn constant_time_eq_all_zero_bytes_returns_true() {
+        assert!(constant_time_eq(&[0u8; 32], &[0u8; 32]));
+    }
+
+    // All-0xFF bytes: both slices equal, accumulator stays 0 (XOR of equal
+    // 0xFF bytes is 0x00).
+    #[test]
+    fn constant_time_eq_all_max_bytes_returns_true() {
+        assert!(constant_time_eq(&[0xffu8; 32], &[0xffu8; 32]));
+    }
+
+    // Mismatch only at the first byte: the fold must detect it regardless of
+    // position; no early-exit optimisation must suppress it.
+    #[test]
+    fn constant_time_eq_mismatch_at_first_byte_only() {
+        let a = [0u8; 16];
+        let mut b = [0u8; 16];
+        b[0] = 1;
+        assert!(!constant_time_eq(&a, &b));
+    }
+
+    // Mismatch only at the last byte: the fold must not stop before reaching it.
+    #[test]
+    fn constant_time_eq_mismatch_at_last_byte_only() {
+        let a = [0u8; 16];
+        let mut b = [0u8; 16];
+        b[15] = 1;
+        assert!(!constant_time_eq(&a, &b));
+    }
+
+    // Length mismatch with identical prefix and all-same bytes: the length
+    // check must still fire even when the byte fold accumulator would be 0.
+    #[test]
+    fn constant_time_eq_equal_prefix_but_length_mismatch_returns_false() {
+        assert!(!constant_time_eq(&[0xaau8; 8], &[0xaau8; 9]));
+        assert!(!constant_time_eq(&[0xaau8; 9], &[0xaau8; 8]));
+    }
+
+    // Typical authentication-token format: raw header value used in practice.
+    #[test]
+    fn constant_time_eq_bearer_token_format_match_and_mismatch() {
+        let token: &[u8] = b"Bearer super-secret-token-xyz-123";
+        assert!(constant_time_eq(token, token));
+        let mut different = token.to_vec();
+        different[7] = b'X';
+        assert!(!constant_time_eq(token, &different));
+    }
+
+    // Large slices (256 bytes): ensures no panic and correct result across
+    // sizes that trigger SIMD/vectorised paths in release builds.
+    #[test]
+    fn constant_time_eq_256_byte_slices_match_and_mismatch() {
+        let a = vec![0xddu8; 256];
+        let b = vec![0xddu8; 256];
+        assert!(constant_time_eq(&a, &b));
+        let mut c = b.clone();
+        c[255] = 0xde;
+        assert!(!constant_time_eq(&a, &c));
+        c[0] = 0xde;
+        assert!(!constant_time_eq(&a, &c));
     }
 }

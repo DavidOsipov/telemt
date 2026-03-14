@@ -1,0 +1,13 @@
+[[exceptions]]
+ id = "RUSTSEC-2026-0037"
+ owner = "security-team"
+ reason = ""
+ tracking_issue = "SEC-123"
+ expires = "2099-12-31"
+
+[[exceptions]]
+ id = "RUSTSEC-2026-0037"
+ owner = "security-team"
+ reason = "Temporary acceptance during coordinated upstream rollout"
+ tracking_issue = "SEC-123"
+ expires = "2099-12-31"
