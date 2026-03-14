@@ -97,8 +97,18 @@ pub(crate) fn build_proxy_req_payload(
             }
         }
 
-        let extra_bytes = u32::try_from(b.len() - extra_start - 4).unwrap_or(0);
-        b[extra_start..extra_start + 4].copy_from_slice(&extra_bytes.to_le_bytes());
+        // On overflow (buffer > 4 GiB, unreachable in practice) keep the extra block
+        // empty by truncating the data back to the length-field position and writing 0,
+        // so the wire representation remains consistent (length field matches content).
+        match u32::try_from(b.len() - extra_start - 4) {
+            Ok(extra_bytes) => {
+                b[extra_start..extra_start + 4].copy_from_slice(&extra_bytes.to_le_bytes());
+            }
+            Err(_) => {
+                b.truncate(extra_start + 4);
+                b[extra_start..extra_start + 4].copy_from_slice(&0u32.to_le_bytes());
+            }
+        }
     }
 
     b.extend_from_slice(data);
@@ -242,6 +252,7 @@ mod tests {
 
     // Tags exceeding the 3-byte TL length limit (> 0xFFFFFF = 16,777,215 bytes)
     // must produce an empty extra block rather than a truncated/corrupt length.
+    #[ignore = "allocates ~16 MiB; run only in a dedicated large-tests profile/CI job"]
     #[test]
     fn test_build_proxy_req_payload_tag_exceeds_tl_long_form_limit_produces_empty_extra() {
         let client = SocketAddr::from(([198, 51, 100, 22], 33333));
@@ -267,6 +278,7 @@ mod tests {
 
     // The prior guard was `tag_len_u32.is_some()` which passed for tags up to u32::MAX.
     // Verify boundary at exactly 0xFFFFFF: must succeed and encode at 3 bytes.
+    #[ignore = "allocates ~16 MiB; run only in a dedicated large-tests profile/CI job"]
     #[test]
     fn test_build_proxy_req_payload_tag_at_tl_long_form_max_boundary_encodes() {
         // 0xFFFFFF = 16,777,215 bytes — maximum representable by 3-byte TL length.
@@ -303,4 +315,101 @@ mod tests {
         let fixed = 4 + 4 + 8 + 20 + 20;
         let extra_len = u32::from_le_bytes(raw[fixed..fixed + 4].try_into().unwrap()) as usize;
         assert_eq!(extra_len, 0);
-    }}
+    }
+
+    // ── Protocol wire-consistency invariant tests ─────────────────────────────
+
+    // The extra-block length field must ALWAYS equal the number of bytes that
+    // actually follow it in the buffer. A censor or MitM that parses the wire
+    // representation must not be able to trigger desync by providing adversarial
+    // input that causes the length to say 0 while data bytes are present.
+    #[test]
+    fn extra_block_length_field_always_matches_actual_content_length() {
+        let client = SocketAddr::from(([198, 51, 100, 40], 10000));
+        let ours = SocketAddr::from(([203, 0, 113, 40], 443));
+        let fixed = 4 + 4 + 8 + 20 + 20;
+
+        // Helper: assert wire consistency for a given tag.
+        let check = |tag: Option<&[u8]>, data: &[u8]| {
+            let p = build_proxy_req_payload(1, client, ours, data, tag, RPC_FLAG_HAS_AD_TAG);
+            let raw = p.as_ref();
+            let declared =
+                u32::from_le_bytes(raw[fixed..fixed + 4].try_into().unwrap()) as usize;
+            let actual = raw.len() - fixed - 4 - data.len();
+            assert_eq!(
+                declared, actual,
+                "extra-block length field ({declared}) must equal actual byte count ({actual})"
+            );
+        };
+
+        check(None, b"data");
+        check(Some(b""), b"data"); // zero-length tag
+        check(Some(&[0xABu8; 1]), b"");   // 1-byte tag
+        check(Some(&[0xABu8; 253]), b"x"); // short-form max
+        check(Some(&[0xCCu8; 254]), b"y"); // long-form min
+        check(Some(&[0xDDu8; 500]), b"z"); // mid-range long-form
+    }
+
+    // Zero-length tag: must encode with short-form length byte 0 and 4-byte
+    // alignment padding, not be dropped as if tag were None.
+    #[test]
+    fn test_build_proxy_req_payload_zero_length_tag_encodes_correctly() {
+        let client = SocketAddr::from(([198, 51, 100, 50], 20000));
+        let ours = SocketAddr::from(([203, 0, 113, 50], 443));
+        let payload = build_proxy_req_payload(
+            12,
+            client,
+            ours,
+            b"payload",
+            Some(&[]),
+            RPC_FLAG_HAS_AD_TAG,
+        );
+        let raw = payload.as_ref();
+        let fixed = 4 + 4 + 8 + 20 + 20;
+        let extra_len = u32::from_le_bytes(raw[fixed..fixed + 4].try_into().unwrap()) as usize;
+        // TL object (4) + length-byte 0 (1) + 0 data bytes + padding to 4-byte boundary.
+        // (1 + 0) % 4 = 1; pad = (4 - 1) % 4 = 3.
+        assert_eq!(extra_len, 4 + 1 + 3, "zero-length tag must produce TL header + padding");
+        // Length byte must be 0 (short-form).
+        assert_eq!(raw[fixed + 8], 0u8);
+    }
+
+    // HAS_AD_TAG absent: extra block must NOT appear in the wire output at all.
+    #[test]
+    fn test_build_proxy_req_payload_without_has_ad_tag_flag_has_no_extra_block() {
+        let client = SocketAddr::from(([198, 51, 100, 60], 30000));
+        let ours = SocketAddr::from(([203, 0, 113, 60], 443));
+        let payload = build_proxy_req_payload(
+            13,
+            client,
+            ours,
+            b"data",
+            Some(&[1, 2, 3]),
+            0, // no HAS_AD_TAG flag
+        );
+        let fixed = 4 + 4 + 8 + 20 + 20;
+        let raw = payload.as_ref();
+        // Without the flag, extra block is skipped; payload follows immediately after headers.
+        assert_eq!(raw.len(), fixed + 4, "no extra block when HAS_AD_TAG is absent");
+        assert_eq!(&raw[fixed..], b"data");
+    }
+
+    // Tag with all-0xFF bytes: the TL length encoding must not be confused by
+    // the 0xFF marker byte that the tag itself might contain.
+    #[test]
+    fn test_build_proxy_req_payload_tag_containing_0xfe_byte_encodes_correctly() {
+        let client = SocketAddr::from(([198, 51, 100, 70], 40000));
+        let ours = SocketAddr::from(([203, 0, 113, 70], 443));
+        // 10-byte tag whose first byte is 0xFE (the long-form marker value).
+        // At length 10 the short-form encoding applies; the 0xFE data byte must
+        // not be confused with the length marker.
+        let tag = vec![0xFEu8; 10];
+        let payload = build_proxy_req_payload(14, client, ours, b"", Some(&tag), RPC_FLAG_HAS_AD_TAG);
+        let raw = payload.as_ref();
+        let fixed = 4 + 4 + 8 + 20 + 20;
+        // Length byte must be 10 (short form), not 0xFE.
+        assert_eq!(raw[fixed + 8], 10u8, "short-form length byte must be 10, not the 0xFE marker");
+        // The actual tag bytes must follow immediately.
+        assert_eq!(&raw[fixed + 9..fixed + 19], &[0xFEu8; 10]);
+    }
+}

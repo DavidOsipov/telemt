@@ -8,7 +8,6 @@
 use bytes::BytesMut;
 use crossbeam_queue::ArrayQueue;
 use std::ops::{Deref, DerefMut};
-use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -20,6 +19,11 @@ pub const DEFAULT_BUFFER_SIZE: usize = 16 * 1024;
 
 /// Default maximum number of pooled buffers
 pub const DEFAULT_MAX_BUFFERS: usize = 1024;
+
+// Buffers that grew beyond this multiple of `buffer_size` are dropped rather
+// than returned to the pool, preventing memory amplification from a single
+// large-payload connection permanently holding oversized allocations.
+const MAX_POOL_BUFFER_OVERSIZE_MULT: usize = 4;
 
 // ============= Buffer Pool =============
 
@@ -97,11 +101,13 @@ impl BufferPool {
     fn return_buffer(&self, mut buffer: BytesMut) {
         buffer.clear();
 
-        // Only return buffers that have at least the canonical capacity so the
-        // pool does not shrink over time when callers grow their buffers.
-        // Over-capacity or full-queue buffers are simply dropped; `allocated`
-        // is a high-water mark and is not decremented here.
-        if buffer.capacity() >= self.buffer_size {
+        // Accept buffers within [buffer_size, buffer_size * MAX_POOL_BUFFER_OVERSIZE_MULT].
+        // The lower bound prevents pool capacity from shrinking over time.
+        // The upper bound drops buffers that grew excessively (e.g. to serve a large
+        // payload) so they do not permanently inflate pool memory or get handed to a
+        // future connection that only needs a small allocation.
+        let max_acceptable = self.buffer_size.saturating_mul(MAX_POOL_BUFFER_OVERSIZE_MULT);
+        if buffer.capacity() >= self.buffer_size && buffer.capacity() <= max_acceptable {
             let _ = self.buffers.push(buffer);
         }
     }
@@ -214,18 +220,19 @@ impl PooledBuffer {
 
 impl Deref for PooledBuffer {
     type Target = BytesMut;
-    
+
     fn deref(&self) -> &Self::Target {
-        static EMPTY_BUFFER: OnceLock<BytesMut> = OnceLock::new();
         self.buffer
             .as_ref()
-            .unwrap_or_else(|| EMPTY_BUFFER.get_or_init(BytesMut::new))
+            .expect("PooledBuffer: attempted to deref after buffer was taken")
     }
 }
 
 impl DerefMut for PooledBuffer {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.buffer.get_or_insert_with(BytesMut::new)
+        self.buffer
+            .as_mut()
+            .expect("PooledBuffer: attempted to deref_mut after buffer was taken")
     }
 }
 
@@ -503,22 +510,27 @@ mod tests {
         );
     }
 
-    // An over-grown buffer (capacity > buffer_size) that is returned to the pool
-    // must still be returned (not dropped) because its capacity exceeds the
-    // required minimum.
+    // A buffer that grew moderately (within MAX_POOL_BUFFER_OVERSIZE_MULT of the canonical
+    // size) must be returned to the pool, because the allocation is still reasonable and
+    // reusing it is more efficient than allocating a new one.
     #[test]
     fn oversized_buffer_is_returned_to_pool() {
-        let pool = Arc::new(BufferPool::with_config(64, 10));
+        let canonical = 64usize;
+        let pool = Arc::new(BufferPool::with_config(canonical, 10));
 
         let mut buf = pool.get();
-        // Manually grow the backing allocation beyond buffer_size.
-        buf.reserve(8192);
-        assert!(buf.capacity() >= 8192);
+        // Grow to 2× the canonical size — within the 4× upper bound.
+        buf.reserve(canonical);
+        assert!(buf.capacity() >= canonical);
+        assert!(
+            buf.capacity() <= canonical * MAX_POOL_BUFFER_OVERSIZE_MULT,
+            "pre-condition: test growth must stay within the acceptable bound"
+        );
         drop(buf);
 
-        // The buffer must have been returned because capacity >= buffer_size.
+        // The buffer must have been returned because capacity is within acceptable range.
         let stats = pool.stats();
-        assert_eq!(stats.pooled, 1, "oversized buffer must be returned to pool");
+        assert_eq!(stats.pooled, 1, "moderately-oversized buffer must be returned to pool");
     }
 
     // A buffer whose capacity fell below buffer_size (e.g. due to take() on
@@ -624,5 +636,98 @@ mod tests {
             stats.allocated
         );
         assert_eq!(stats.hits, 50);
+    }
+
+    // ── Security invariant: sensitive data must not leak between pool users ───
+
+    // A buffer containing "sensitive" bytes must be zeroed before being handed
+    // to the next caller. An attacker who can trigger repeated pool cycles against
+    // a shared buffer slot must not be able to read prior connection data.
+    #[test]
+    fn pooled_buffer_sensitive_data_is_cleared_before_reuse() {
+        let pool = Arc::new(BufferPool::with_config(64, 2));
+        {
+            let mut buf = pool.get();
+            buf.extend_from_slice(b"credentials:password123");
+            // Drop returns the buffer to the pool after clearing.
+        }
+        {
+            let buf = pool.get();
+            // Buffer must be empty — no leftover bytes from the previous user.
+            assert!(buf.is_empty(), "pool must clear buffer before handing it to the next caller");
+            assert_eq!(buf.len(), 0);
+        }
+    }
+
+    // Verify that calling take() extracts the full content and the extracted
+    // BytesMut does NOT get returned to the pool (no double-return).
+    #[test]
+    fn pooled_buffer_take_eliminates_pool_return() {
+        let pool = Arc::new(BufferPool::with_config(64, 2));
+        let stats_before = pool.stats();
+
+        let mut buf = pool.get(); // miss
+        buf.extend_from_slice(b"important");
+        let inner = buf.take(); // consumes PooledBuffer, should NOT return to pool
+
+        assert_eq!(&inner[..], b"important");
+        let stats_after = pool.stats();
+        // pooled count must not increase — take() bypasses the pool
+        assert_eq!(
+            stats_after.pooled, stats_before.pooled,
+            "take() must not return the buffer to the pool"
+        );
+    }
+
+    // Multiple concurrent get() calls must each get an independent empty buffer,
+    // not aliased memory. An adversary who can cause aliased buffer access could
+    // read or corrupt another connection's in-flight data.
+    #[test]
+    fn pooled_buffers_are_independent_no_aliasing() {
+        let pool = Arc::new(BufferPool::with_config(64, 4));
+        let mut b1 = pool.get();
+        let mut b2 = pool.get();
+
+        b1.extend_from_slice(b"connection-A");
+        b2.extend_from_slice(b"connection-B");
+
+        assert_eq!(&b1[..], b"connection-A");
+        assert_eq!(&b2[..], b"connection-B");
+        // Verify no aliasing: modifying b2 does not affect b1.
+        assert_ne!(&b1[..], &b2[..]);
+    }
+
+    // Oversized buffers (capacity grown beyond pool's canonical size) must NOT
+    // be returned to the pool — this prevents the pool from holding oversized
+    // buffers that could be handed to unrelated connections and leak large chunks
+    // of heap across connection boundaries.
+    #[test]
+    fn oversized_buffer_is_dropped_not_pooled() {
+        let canonical = 64usize;
+        let pool = Arc::new(BufferPool::with_config(canonical, 4));
+
+        {
+            let mut buf = pool.get();
+            // Grow well beyond the canonical size.
+            buf.extend(std::iter::repeat(0u8).take(canonical * 8));
+            // Drop should abandon this oversized buffer rather than returning it.
+        }
+
+        let stats = pool.stats();
+        // Pool must be empty: the oversized buffer was not re-queued.
+        assert_eq!(
+            stats.pooled, 0,
+            "oversized buffer must be dropped, not returned to pool (got {} pooled)",
+            stats.pooled
+        );
+    }
+
+    // Deref on a PooledBuffer obtained normally must NOT panic.
+    #[test]
+    fn pooled_buffer_deref_on_live_buffer_does_not_panic() {
+        let pool = Arc::new(BufferPool::new());
+        let mut buf = pool.get();
+        buf.extend_from_slice(b"hello");
+        assert_eq!(&buf[..], b"hello");
     }
 }

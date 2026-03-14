@@ -382,20 +382,7 @@ mod tests {
     }
 
     // ObfuscationParams must NOT implement Clone — key material must not be duplicated.
-    // This is a compile-time enforcement test via negative trait assertion.
-    // If Clone were derived again, this assertion would fail to compile.
-    #[test]
-    fn test_obfuscation_params_is_not_clone() {
-        fn assert_not_clone<T: ?Sized>() {}
-        // The trait bound below must NOT hold. We verify by trying to assert
-        // Clone is NOT available: calling ::clone() on the type must not compile.
-        // Since we cannot express negative bounds in stable Rust, we use the
-        // auto_trait approach: verify the type is not Clone via a static assertion.
-        // If this test compiles and passes, Clone is absent from ObfuscationParams.
-        struct NotClone;
-        impl NotClone { fn check() { assert_not_clone::<ObfuscationParams>(); } }
-        // The above does not assert Clone is absent; the real guard is that the
-        // compiler will reject any `.clone()` call site. This test documents intent.
-        NotClone::check();
-    }
+    // Enforced at compile time: if Clone is ever derived or manually implemented for
+    // ObfuscationParams, this assertion will fail to compile.
+    static_assertions::assert_not_impl_any!(ObfuscationParams: Clone);
 }
