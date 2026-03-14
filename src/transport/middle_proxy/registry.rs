@@ -147,7 +147,7 @@ impl ConnRegistry {
             .or_insert_with(HashSet::new);
     }
 
-    /// Unregister connection, returning associated writer_id if any.
+    /// Unregister connection, returning associated `writer_id` if any.
     pub async fn unregister(&self, id: u64) -> Option<u64> {
         let mut inner = self.inner.write().await;
         inner.map.remove(&id);
