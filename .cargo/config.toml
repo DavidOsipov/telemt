@@ -4,7 +4,7 @@
 # rustc and produce "unknown lint" warnings on every cargo build/check/test
 # invocation, which silently defeats the enforcement intent and will break any
 # job that sets -D warnings.  All clippy lints must be configured exclusively
-# via `cargo clippy` in the CI workflow (see .github/workflows/security.yml).
+# via `cargo clippy` invocations in CI workflows.
 [build]
 rustflags = [
     # Forbid unsafe code globally; this is a rustc-native lint.
