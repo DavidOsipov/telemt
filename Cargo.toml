@@ -2,6 +2,7 @@
 name = "telemt"
 version = "3.3.18"
 edition = "2024"
+license-file = "LICENSE"
 
 [dependencies]
 # C
