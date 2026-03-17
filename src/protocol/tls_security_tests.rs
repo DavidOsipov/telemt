@@ -1,5 +1,8 @@
 use super::*;
 use crate::crypto::sha256_hmac;
+use crate::tls_front::emulator::build_emulated_server_hello;
+use crate::tls_front::types::{CachedTlsData, ParsedServerHello, TlsBehaviorProfile, TlsProfileSource};
+use std::time::SystemTime;
 
 /// Build a TLS-handshake-like buffer that contains a valid HMAC digest
 /// for the given `secret` and `timestamp`.
@@ -369,16 +372,16 @@ fn one_byte_session_id_validates_and_is_preserved() {
 }
 
 #[test]
-fn max_session_id_len_255_with_valid_digest_is_accepted() {
+fn max_session_id_len_255_with_valid_digest_is_rejected_by_rfc_cap() {
     let secret = b"sid_len_255_test";
     let session_id = vec![0xCCu8; 255];
     let handshake = make_valid_tls_handshake_with_session_id(secret, 0, &session_id);
     let secrets = vec![("u".to_string(), secret.to_vec())];
 
-    let result = validate_tls_handshake(&handshake, &secrets, true)
-        .expect("session_id_len=255 with valid digest must validate");
-    assert_eq!(result.session_id.len(), 255);
-    assert_eq!(result.session_id, session_id);
+    assert!(
+        validate_tls_handshake(&handshake, &secrets, true).is_none(),
+        "legacy_session_id length > 32 must be rejected even with valid digest"
+    );
 }
 
 // ------------------------------------------------------------------
@@ -1187,17 +1190,158 @@ fn test_gen_fake_x25519_key() {
 }
 
 #[test]
-fn test_fake_x25519_key_is_quadratic_residue() {
-    use num_bigint::BigUint;
-    use num_traits::One;
-
+fn test_fake_x25519_key_is_nonzero_and_varies() {
     let rng = crate::crypto::SecureRandom::new();
-    let key = gen_fake_x25519_key(&rng);
-    let p = curve25519_prime();
-    let k_num = BigUint::from_bytes_le(&key);
-    let exponent = (&p - BigUint::one()) >> 1;
-    let legendre = k_num.modpow(&exponent, &p);
-    assert_eq!(legendre, BigUint::one());
+    let mut unique = std::collections::HashSet::new();
+    let mut saw_non_zero = false;
+
+    for _ in 0..64 {
+        let key = gen_fake_x25519_key(&rng);
+        if key != [0u8; 32] {
+            saw_non_zero = true;
+        }
+        unique.insert(key);
+    }
+
+    assert!(
+        saw_non_zero,
+        "generated X25519 public keys must not collapse to all-zero output"
+    );
+    assert!(
+        unique.len() > 1,
+        "generated X25519 public keys must vary across invocations"
+    );
+}
+
+#[test]
+fn validate_tls_handshake_rejects_session_id_longer_than_rfc_cap() {
+    let secret = b"session_id_cap_secret";
+    let oversized_sid = vec![0x42u8; 33];
+    let handshake = make_valid_tls_handshake_with_session_id(secret, 0, &oversized_sid);
+    let secrets = vec![("u".to_string(), secret.to_vec())];
+
+    assert!(
+        validate_tls_handshake(&handshake, &secrets, true).is_none(),
+        "legacy_session_id length > 32 must be rejected"
+    );
+}
+
+fn server_hello_extension_types(record: &[u8]) -> Vec<u16> {
+    if record.len() < 9 || record[0] != TLS_RECORD_HANDSHAKE || record[5] != 0x02 {
+        return Vec::new();
+    }
+
+    let record_len = u16::from_be_bytes([record[3], record[4]]) as usize;
+    if record.len() < 5 + record_len {
+        return Vec::new();
+    }
+
+    let hs_len = u32::from_be_bytes([0, record[6], record[7], record[8]]) as usize;
+    let hs_start = 5;
+    let hs_end = hs_start + 4 + hs_len;
+    if hs_end > record.len() {
+        return Vec::new();
+    }
+
+    let mut pos = hs_start + 4 + 2 + 32;
+    if pos >= hs_end {
+        return Vec::new();
+    }
+    let sid_len = record[pos] as usize;
+    pos += 1 + sid_len;
+    if pos + 2 + 1 + 2 > hs_end {
+        return Vec::new();
+    }
+
+    pos += 2 + 1;
+    let ext_len = u16::from_be_bytes([record[pos], record[pos + 1]]) as usize;
+    pos += 2;
+    let ext_end = pos + ext_len;
+    if ext_end > hs_end {
+        return Vec::new();
+    }
+
+    let mut out = Vec::new();
+    while pos + 4 <= ext_end {
+        let etype = u16::from_be_bytes([record[pos], record[pos + 1]]);
+        let elen = u16::from_be_bytes([record[pos + 2], record[pos + 3]]) as usize;
+        pos += 4;
+        if pos + elen > ext_end {
+            break;
+        }
+        out.push(etype);
+        pos += elen;
+    }
+    out
+}
+
+#[test]
+fn build_server_hello_never_places_alpn_in_server_hello_extensions() {
+    let secret = b"alpn_sh_forbidden";
+    let client_digest = [0x11u8; 32];
+    let session_id = vec![0xAA; 32];
+    let rng = crate::crypto::SecureRandom::new();
+
+    let response = build_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        1024,
+        &rng,
+        Some(b"h2".to_vec()),
+        0,
+    );
+    let exts = server_hello_extension_types(&response);
+    assert!(
+        !exts.contains(&0x0010),
+        "ALPN extension must not appear in ServerHello"
+    );
+}
+
+#[test]
+fn emulated_server_hello_never_places_alpn_in_server_hello_extensions() {
+    let secret = b"alpn_emulated_forbidden";
+    let client_digest = [0x22u8; 32];
+    let session_id = vec![0xAB; 32];
+    let rng = crate::crypto::SecureRandom::new();
+    let cached = CachedTlsData {
+        server_hello_template: ParsedServerHello {
+            version: TLS_VERSION,
+            random: [0u8; 32],
+            session_id: Vec::new(),
+            cipher_suite: [0x13, 0x01],
+            compression: 0,
+            extensions: Vec::new(),
+        },
+        cert_info: None,
+        cert_payload: None,
+        app_data_records_sizes: vec![1024],
+        total_app_data_len: 1024,
+        behavior_profile: TlsBehaviorProfile {
+            change_cipher_spec_count: 1,
+            app_data_record_sizes: vec![1024],
+            ticket_record_sizes: Vec::new(),
+            source: TlsProfileSource::Default,
+        },
+        fetched_at: SystemTime::now(),
+        domain: "example.com".to_string(),
+    };
+
+    let response = build_emulated_server_hello(
+        secret,
+        &client_digest,
+        &session_id,
+        &cached,
+        false,
+        &rng,
+        Some(b"h2".to_vec()),
+        0,
+    );
+    let exts = server_hello_extension_types(&response);
+    assert!(
+        !exts.contains(&0x0010),
+        "ALPN extension must not appear in emulated ServerHello"
+    );
 }
 
 #[test]

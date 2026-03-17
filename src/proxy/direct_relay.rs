@@ -1,3 +1,4 @@
+use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -25,8 +26,18 @@ use crate::stats::Stats;
 use crate::stream::{BufferPool, CryptoReader, CryptoWriter};
 use crate::transport::UpstreamManager;
 
+#[cfg(unix)]
+use std::os::unix::fs::OpenOptionsExt;
+
 const UNKNOWN_DC_LOG_DISTINCT_LIMIT: usize = 1024;
 static LOGGED_UNKNOWN_DCS: OnceLock<Mutex<HashSet<i16>>> = OnceLock::new();
+
+#[derive(Clone)]
+struct SanitizedUnknownDcLogPath {
+    resolved_path: PathBuf,
+    allowed_parent: PathBuf,
+    file_name: OsString,
+}
 
 // In tests, this function shares global mutable state. Callers that also use
 // cache-reset helpers must hold `unknown_dc_test_lock()` to keep assertions
@@ -52,7 +63,7 @@ fn should_log_unknown_dc_with_set(set: &Mutex<HashSet<i16>>, dc_idx: i16) -> boo
     }
 }
 
-fn sanitize_unknown_dc_log_path(path: &str) -> Option<PathBuf> {
+fn sanitize_unknown_dc_log_path(path: &str) -> Option<SanitizedUnknownDcLogPath> {
     let candidate = Path::new(path);
     if candidate.as_os_str().is_empty() {
         return None;
@@ -77,7 +88,52 @@ fn sanitize_unknown_dc_log_path(path: &str) -> Option<PathBuf> {
         return None;
     }
 
-    Some(canonical_parent.join(file_name))
+    Some(SanitizedUnknownDcLogPath {
+        resolved_path: canonical_parent.join(file_name),
+        allowed_parent: canonical_parent,
+        file_name: file_name.to_os_string(),
+    })
+}
+
+fn unknown_dc_log_path_is_still_safe(path: &SanitizedUnknownDcLogPath) -> bool {
+    let Some(parent) = path.resolved_path.parent() else {
+        return false;
+    };
+    let Ok(current_parent) = parent.canonicalize() else {
+        return false;
+    };
+    if current_parent != path.allowed_parent {
+        return false;
+    }
+
+    if let Ok(canonical_target) = path.resolved_path.canonicalize() {
+        let Some(target_parent) = canonical_target.parent() else {
+            return false;
+        };
+        let Some(target_name) = canonical_target.file_name() else {
+            return false;
+        };
+        if target_parent != path.allowed_parent || target_name != path.file_name {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn open_unknown_dc_log_append(path: &Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)
+    }
+    #[cfg(not(unix))]
+    {
+        OpenOptions::new().create(true).append(true).open(path)
+    }
 }
 
 #[cfg(test)]
@@ -234,7 +290,9 @@ fn get_dc_addr_static(dc_idx: i16, config: &ProxyConfig) -> Result<SocketAddr> {
         {
             if let Some(path) = sanitize_unknown_dc_log_path(path) {
                 handle.spawn_blocking(move || {
-                    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+                    if unknown_dc_log_path_is_still_safe(&path)
+                        && let Ok(mut file) = open_unknown_dc_log_append(&path.resolved_path)
+                    {
                         let _ = writeln!(file, "dc_idx={dc_idx}");
                     }
                 });

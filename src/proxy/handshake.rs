@@ -4,11 +4,11 @@
 
 use std::net::SocketAddr;
 use std::collections::HashSet;
+use std::collections::hash_map::RandomState;
 use std::net::{IpAddr, Ipv6Addr};
 use std::sync::Arc;
 use std::sync::{Mutex, OnceLock};
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use std::hash::{BuildHasher, Hash, Hasher};
 use std::time::{Duration, Instant};
 use dashmap::DashMap;
 use dashmap::mapref::entry::Entry;
@@ -64,6 +64,7 @@ struct AuthProbeSaturationState {
 
 static AUTH_PROBE_STATE: OnceLock<DashMap<IpAddr, AuthProbeState>> = OnceLock::new();
 static AUTH_PROBE_SATURATION_STATE: OnceLock<Mutex<Option<AuthProbeSaturationState>>> = OnceLock::new();
+static AUTH_PROBE_EVICTION_HASHER: OnceLock<RandomState> = OnceLock::new();
 
 fn auth_probe_state_map() -> &'static DashMap<IpAddr, AuthProbeState> {
     AUTH_PROBE_STATE.get_or_init(DashMap::new)
@@ -101,7 +102,8 @@ fn auth_probe_state_expired(state: &AuthProbeState, now: Instant) -> bool {
 }
 
 fn auth_probe_eviction_offset(peer_ip: IpAddr, now: Instant) -> usize {
-    let mut hasher = DefaultHasher::new();
+    let hasher_state = AUTH_PROBE_EVICTION_HASHER.get_or_init(RandomState::new);
+    let mut hasher = hasher_state.build_hasher();
     peer_ip.hash(&mut hasher);
     now.hash(&mut hasher);
     hasher.finish() as usize
@@ -234,32 +236,79 @@ fn auth_probe_record_failure_with_state(
     }
 
     if state.len() >= AUTH_PROBE_TRACK_MAX_ENTRIES {
-        let mut stale_keys = Vec::new();
-        let mut oldest_candidate: Option<(IpAddr, Instant)> = None;
-        for entry in state.iter().take(AUTH_PROBE_PRUNE_SCAN_LIMIT) {
-            let key = *entry.key();
-            let last_seen = entry.value().last_seen;
-            match oldest_candidate {
-                Some((_, oldest_seen)) if last_seen >= oldest_seen => {}
-                _ => oldest_candidate = Some((key, last_seen)),
+        let mut rounds = 0usize;
+        while state.len() >= AUTH_PROBE_TRACK_MAX_ENTRIES {
+            rounds += 1;
+            if rounds > 8 {
+                auth_probe_note_saturation(now);
+                return;
             }
-            if auth_probe_state_expired(entry.value(), now) {
-                stale_keys.push(key);
+
+            let mut stale_keys = Vec::new();
+            let mut eviction_candidate: Option<(IpAddr, u32, Instant)> = None;
+            let state_len = state.len();
+            let scan_limit = state_len.min(AUTH_PROBE_PRUNE_SCAN_LIMIT);
+            let start_offset = if state_len == 0 {
+                0
+            } else {
+                auth_probe_eviction_offset(peer_ip, now) % state_len
+            };
+
+            let mut scanned = 0usize;
+            for entry in state.iter().skip(start_offset) {
+                let key = *entry.key();
+                let fail_streak = entry.value().fail_streak;
+                let last_seen = entry.value().last_seen;
+                match eviction_candidate {
+                    Some((_, current_fail, current_seen))
+                        if fail_streak > current_fail
+                            || (fail_streak == current_fail && last_seen >= current_seen) =>
+                    {
+                    }
+                    _ => eviction_candidate = Some((key, fail_streak, last_seen)),
+                }
+                if auth_probe_state_expired(entry.value(), now) {
+                    stale_keys.push(key);
+                }
+                scanned += 1;
+                if scanned >= scan_limit {
+                    break;
+                }
             }
-        }
-        for stale_key in stale_keys {
-            state.remove(&stale_key);
-        }
-        if state.len() >= AUTH_PROBE_TRACK_MAX_ENTRIES {
-            let Some((evict_key, _)) = oldest_candidate else {
+
+            if scanned < scan_limit {
+                for entry in state.iter().take(scan_limit - scanned) {
+                    let key = *entry.key();
+                    let fail_streak = entry.value().fail_streak;
+                    let last_seen = entry.value().last_seen;
+                    match eviction_candidate {
+                        Some((_, current_fail, current_seen))
+                            if fail_streak > current_fail
+                                || (fail_streak == current_fail && last_seen >= current_seen) =>
+                        {
+                        }
+                        _ => eviction_candidate = Some((key, fail_streak, last_seen)),
+                    }
+                    if auth_probe_state_expired(entry.value(), now) {
+                        stale_keys.push(key);
+                    }
+                }
+            }
+
+            for stale_key in stale_keys {
+                state.remove(&stale_key);
+            }
+
+            if state.len() < AUTH_PROBE_TRACK_MAX_ENTRIES {
+                break;
+            }
+
+            let Some((evict_key, _, _)) = eviction_candidate else {
                 auth_probe_note_saturation(now);
                 return;
             };
             state.remove(&evict_key);
             auth_probe_note_saturation(now);
-            if state.len() >= AUTH_PROBE_TRACK_MAX_ENTRIES {
-                return;
-            }
         }
     }
 

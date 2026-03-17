@@ -1,4 +1,8 @@
 use super::*;
+use rand::{Rng, SeedableRng};
+use rand::rngs::StdRng;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[test]
 fn cutover_stagger_delay_is_deterministic_for_same_inputs() {
@@ -79,6 +83,236 @@ fn affected_cutover_state_triggers_only_for_newer_generation() {
 
     assert_eq!(seen.generation, next.generation);
     assert_eq!(seen.mode, RelayRouteMode::Middle);
+}
+
+#[test]
+fn integration_watch_and_snapshot_follow_same_transition_sequence() {
+    let runtime = RouteRuntimeController::new(RelayRouteMode::Direct);
+    let rx = runtime.subscribe();
+
+    let sequence = [
+        RelayRouteMode::Middle,
+        RelayRouteMode::Middle,
+        RelayRouteMode::Direct,
+        RelayRouteMode::Direct,
+        RelayRouteMode::Middle,
+    ];
+
+    let mut expected_generation = 0u64;
+    let mut expected_mode = RelayRouteMode::Direct;
+
+    for target in sequence {
+        let changed = runtime.set_mode(target);
+        if target == expected_mode {
+            assert!(changed.is_none(), "idempotent transition must return none");
+        } else {
+            expected_mode = target;
+            expected_generation = expected_generation.saturating_add(1);
+            let emitted = changed.expect("real transition must emit cutover state");
+            assert_eq!(emitted.mode, expected_mode);
+            assert_eq!(emitted.generation, expected_generation);
+        }
+
+        let snap = runtime.snapshot();
+        let watched = *rx.borrow();
+        assert_eq!(snap, watched, "snapshot and watch state must stay aligned");
+        assert_eq!(snap.mode, expected_mode);
+        assert_eq!(snap.generation, expected_generation);
+    }
+}
+
+#[test]
+fn session_is_not_affected_when_mode_matches_even_if_generation_advanced() {
+    let session_mode = RelayRouteMode::Direct;
+    let current = RouteCutoverState {
+        mode: RelayRouteMode::Direct,
+        generation: 2,
+    };
+    let session_generation = 0;
+
+    assert!(
+        !is_session_affected_by_cutover(current, session_mode, session_generation),
+        "session on matching final route mode should not be force-cut over on intermediate generation bumps"
+    );
+}
+
+#[test]
+fn cutover_predicate_rejects_equal_generation_even_if_mode_differs() {
+    let current = RouteCutoverState {
+        mode: RelayRouteMode::Middle,
+        generation: 77,
+    };
+    assert!(
+        !is_session_affected_by_cutover(current, RelayRouteMode::Direct, 77),
+        "equal generation must never trigger cutover regardless of mode mismatch"
+    );
+}
+
+#[test]
+fn adversarial_route_oscillation_only_cuts_over_sessions_with_different_final_mode() {
+    let runtime = RouteRuntimeController::new(RelayRouteMode::Direct);
+    let rx = runtime.subscribe();
+    let session_generation = runtime.snapshot().generation;
+
+    runtime
+        .set_mode(RelayRouteMode::Middle)
+        .expect("direct->middle must transition");
+    runtime
+        .set_mode(RelayRouteMode::Direct)
+        .expect("middle->direct must transition");
+
+    assert!(
+        affected_cutover_state(&rx, RelayRouteMode::Direct, session_generation).is_none(),
+        "direct session should survive when final mode returns to direct"
+    );
+    assert!(
+        affected_cutover_state(&rx, RelayRouteMode::Middle, session_generation).is_some(),
+        "middle session should be cut over when final mode is direct"
+    );
+}
+
+#[test]
+fn light_fuzz_cutover_predicate_matches_reference_oracle() {
+    let mut rng = StdRng::seed_from_u64(0xC0DEC0DE5EED);
+    for _ in 0..20_000 {
+        let current = RouteCutoverState {
+            mode: if rng.random::<bool>() {
+                RelayRouteMode::Direct
+            } else {
+                RelayRouteMode::Middle
+            },
+            generation: rng.random_range(0u64..1_000_000),
+        };
+        let session_mode = if rng.random::<bool>() {
+            RelayRouteMode::Direct
+        } else {
+            RelayRouteMode::Middle
+        };
+        let session_generation = rng.random_range(0u64..1_000_000);
+
+        let expected = current.generation > session_generation && current.mode != session_mode;
+        let actual = is_session_affected_by_cutover(current, session_mode, session_generation);
+        assert_eq!(
+            actual, expected,
+            "cutover predicate must match mode-aware generation oracle"
+        );
+    }
+}
+
+#[test]
+fn light_fuzz_set_mode_generation_tracks_only_real_transitions() {
+    let runtime = RouteRuntimeController::new(RelayRouteMode::Direct);
+    let mut rng = StdRng::seed_from_u64(0x0DDC0FFE);
+
+    let mut expected_mode = RelayRouteMode::Direct;
+    let mut expected_generation = 0u64;
+
+    for _ in 0..10_000 {
+        let candidate = if rng.random::<bool>() {
+            RelayRouteMode::Direct
+        } else {
+            RelayRouteMode::Middle
+        };
+        let changed = runtime.set_mode(candidate);
+
+        if candidate == expected_mode {
+            assert!(changed.is_none(), "idempotent set_mode must not emit cutover state");
+        } else {
+            expected_mode = candidate;
+            expected_generation = expected_generation.saturating_add(1);
+            let next = changed.expect("mode transition must emit cutover state");
+            assert_eq!(next.mode, expected_mode);
+            assert_eq!(next.generation, expected_generation);
+        }
+    }
+
+    let final_state = runtime.snapshot();
+    assert_eq!(final_state.mode, expected_mode);
+    assert_eq!(final_state.generation, expected_generation);
+}
+
+#[test]
+fn stress_snapshot_and_watch_state_remain_consistent_under_concurrent_switch_storm() {
+    let runtime = Arc::new(RouteRuntimeController::new(RelayRouteMode::Direct));
+
+    std::thread::scope(|scope| {
+        let mut writers = Vec::new();
+        for worker in 0..4usize {
+            let runtime = Arc::clone(&runtime);
+            writers.push(scope.spawn(move || {
+                for step in 0..20_000usize {
+                    let mode = if (worker + step) % 2 == 0 {
+                        RelayRouteMode::Direct
+                    } else {
+                        RelayRouteMode::Middle
+                    };
+                    let _ = runtime.set_mode(mode);
+                }
+            }));
+        }
+
+        for writer in writers {
+            writer
+                .join()
+                .expect("route mode writer thread must not panic");
+        }
+
+        let rx = runtime.subscribe();
+        for _ in 0..128 {
+            assert_eq!(
+                runtime.snapshot(),
+                *rx.borrow(),
+                "snapshot and watch state must converge after concurrent set_mode churn"
+            );
+            std::thread::yield_now();
+        }
+    });
+}
+
+#[test]
+fn stress_concurrent_transition_count_matches_final_generation() {
+    let runtime = Arc::new(RouteRuntimeController::new(RelayRouteMode::Direct));
+    let successful_transitions = Arc::new(AtomicU64::new(0));
+
+    std::thread::scope(|scope| {
+        let mut workers = Vec::new();
+        for worker in 0..6usize {
+            let runtime = Arc::clone(&runtime);
+            let successful_transitions = Arc::clone(&successful_transitions);
+            workers.push(scope.spawn(move || {
+                let mut state = (worker as u64 + 1).wrapping_mul(0x9E37_79B9_7F4A_7C15);
+                for _ in 0..25_000usize {
+                    state ^= state << 7;
+                    state ^= state >> 9;
+                    state ^= state << 8;
+                    let mode = if (state & 1) == 0 {
+                        RelayRouteMode::Direct
+                    } else {
+                        RelayRouteMode::Middle
+                    };
+                    if runtime.set_mode(mode).is_some() {
+                        successful_transitions.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            }));
+        }
+
+        for worker in workers {
+            worker.join().expect("route mode transition worker must not panic");
+        }
+    });
+
+    let final_state = runtime.snapshot();
+    assert_eq!(
+        final_state.generation,
+        successful_transitions.load(Ordering::Relaxed),
+        "final generation must equal number of accepted mode transitions"
+    );
+    assert_eq!(
+        final_state,
+        *runtime.subscribe().borrow(),
+        "watch and snapshot state must match after concurrent transition accounting"
+    );
 }
 
 #[test]

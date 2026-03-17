@@ -7,6 +7,7 @@ use crate::stats::Stats;
 use crate::stream::{BufferPool, CryptoReader, CryptoWriter};
 use crate::transport::UpstreamManager;
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -182,7 +183,7 @@ fn unknown_dc_log_path_sanitizer_accepts_absolute_paths_with_existing_parent() {
 
     let sanitized = sanitize_unknown_dc_log_path(absolute_str)
         .expect("absolute paths with existing parent must be accepted");
-    assert_eq!(sanitized, absolute);
+    assert_eq!(sanitized.resolved_path, absolute);
 }
 
 #[test]
@@ -206,7 +207,7 @@ fn unknown_dc_log_path_sanitizer_accepts_safe_relative_path() {
 
     let sanitized = sanitize_unknown_dc_log_path(&candidate_relative)
         .expect("safe relative path with existing parent must be accepted");
-    assert_eq!(sanitized, candidate);
+    assert_eq!(sanitized.resolved_path, candidate);
 }
 
 #[test]
@@ -226,7 +227,7 @@ fn unknown_dc_log_path_sanitizer_accepts_directory_only_as_filename_projection()
     let sanitized = sanitize_unknown_dc_log_path("target/")
         .expect("directory-only input is interpreted as filename projection in current sanitizer");
     assert!(
-        sanitized.ends_with("target"),
+        sanitized.resolved_path.ends_with("target"),
         "directory-only input should resolve to canonical parent plus filename projection"
     );
 }
@@ -243,7 +244,7 @@ fn unknown_dc_log_path_sanitizer_accepts_dot_prefixed_relative_path() {
     let expected = abs_dir.join("unknown-dc.log");
     let sanitized = sanitize_unknown_dc_log_path(&rel_candidate)
         .expect("dot-prefixed safe path must be accepted");
-    assert_eq!(sanitized, expected);
+    assert_eq!(sanitized.resolved_path, expected);
 }
 
 #[test]
@@ -300,7 +301,7 @@ fn unknown_dc_log_path_sanitizer_accepts_symlinked_parent_inside_workspace() {
     let sanitized = sanitize_unknown_dc_log_path(&rel_candidate)
         .expect("symlinked parent that resolves inside workspace must be accepted");
     assert!(
-        sanitized.starts_with(&real_parent),
+        sanitized.resolved_path.starts_with(&real_parent),
         "sanitized path must resolve to canonical internal parent"
     );
 }
@@ -328,8 +329,301 @@ fn unknown_dc_log_path_sanitizer_accepts_symlink_parent_escape_as_canonical_path
     let sanitized = sanitize_unknown_dc_log_path(&rel_candidate)
         .expect("symlinked parent must canonicalize to target path");
     assert!(
-        sanitized.starts_with(Path::new("/tmp")),
+        sanitized.resolved_path.starts_with(Path::new("/tmp")),
         "sanitized path must resolve to canonical symlink target"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unknown_dc_log_path_revalidation_rejects_symlinked_target_escape() {
+    use std::os::unix::fs::symlink;
+
+    let base = std::env::current_dir()
+        .expect("cwd must be available")
+        .join("target")
+        .join(format!("telemt-unknown-dc-target-link-{}", std::process::id()));
+    fs::create_dir_all(&base).expect("target-link base must be creatable");
+
+    let outside = std::env::temp_dir().join(format!("telemt-outside-{}", std::process::id()));
+    let _ = fs::remove_file(&outside);
+    fs::write(&outside, "outside").expect("outside file must be writable");
+
+    let linked_target = base.join("unknown-dc.log");
+    let _ = fs::remove_file(&linked_target);
+    symlink(&outside, &linked_target).expect("target symlink must be creatable");
+
+    let rel_candidate = format!(
+        "target/telemt-unknown-dc-target-link-{}/unknown-dc.log",
+        std::process::id()
+    );
+    let sanitized = sanitize_unknown_dc_log_path(&rel_candidate)
+        .expect("candidate should sanitize before final revalidation");
+
+    assert!(
+        !unknown_dc_log_path_is_still_safe(&sanitized),
+        "final revalidation must reject symlinked target escape"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unknown_dc_open_append_rejects_symlink_target_with_nofollow() {
+    use std::os::unix::fs::symlink;
+
+    let base = std::env::current_dir()
+        .expect("cwd must be available")
+        .join("target")
+        .join(format!("telemt-unknown-dc-nofollow-{}", std::process::id()));
+    fs::create_dir_all(&base).expect("nofollow base must be creatable");
+
+    let outside = std::env::temp_dir().join(format!(
+        "telemt-unknown-dc-nofollow-outside-{}.log",
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&outside);
+    fs::write(&outside, "outside\n").expect("outside file must be writable");
+
+    let linked_target = base.join("unknown-dc.log");
+    let _ = fs::remove_file(&linked_target);
+    symlink(&outside, &linked_target).expect("symlink target must be creatable");
+
+    let err = open_unknown_dc_log_append(&linked_target)
+        .expect_err("O_NOFOLLOW open must fail for symlink target");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::ELOOP),
+        "symlink target must be rejected with ELOOP when O_NOFOLLOW is applied"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unknown_dc_open_append_rejects_broken_symlink_target_with_nofollow() {
+    use std::os::unix::fs::symlink;
+
+    let base = std::env::current_dir()
+        .expect("cwd must be available")
+        .join("target")
+        .join(format!("telemt-unknown-dc-broken-link-{}", std::process::id()));
+    fs::create_dir_all(&base).expect("broken-link base must be creatable");
+
+    let linked_target = base.join("unknown-dc.log");
+    let _ = fs::remove_file(&linked_target);
+    symlink(base.join("missing-target.log"), &linked_target)
+        .expect("broken symlink target must be creatable");
+
+    let err = open_unknown_dc_log_append(&linked_target)
+        .expect_err("O_NOFOLLOW open must fail for broken symlink target");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::ELOOP),
+        "broken symlink target must be rejected with ELOOP when O_NOFOLLOW is applied"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn adversarial_unknown_dc_open_append_symlink_flip_never_writes_outside_file() {
+    use std::os::unix::fs::symlink;
+
+    let base = std::env::current_dir()
+        .expect("cwd must be available")
+        .join("target")
+        .join(format!("telemt-unknown-dc-symlink-flip-{}", std::process::id()));
+    fs::create_dir_all(&base).expect("symlink-flip base must be creatable");
+
+    let outside = std::env::temp_dir().join(format!(
+        "telemt-unknown-dc-symlink-flip-outside-{}.log",
+        std::process::id()
+    ));
+    fs::write(&outside, "outside-baseline\n").expect("outside baseline file must be writable");
+    let outside_before = fs::read_to_string(&outside).expect("outside baseline must be readable");
+
+    let target = base.join("unknown-dc.log");
+    let _ = fs::remove_file(&target);
+
+    for step in 0..1024usize {
+        let _ = fs::remove_file(&target);
+        if step % 2 == 0 {
+            symlink(&outside, &target).expect("symlink creation in flip loop must succeed");
+        }
+        if let Ok(mut file) = open_unknown_dc_log_append(&target) {
+            writeln!(file, "dc_idx={step}").expect("append on regular file must succeed");
+        }
+    }
+
+    let outside_after = fs::read_to_string(&outside).expect("outside file must remain readable");
+    assert_eq!(
+        outside_after, outside_before,
+        "outside file must never be modified under symlink-flip adversarial churn"
+    );
+}
+
+#[test]
+fn unknown_dc_open_append_creates_regular_file() {
+    let base = std::env::current_dir()
+        .expect("cwd must be available")
+        .join("target")
+        .join(format!("telemt-unknown-dc-open-{}", std::process::id()));
+    fs::create_dir_all(&base).expect("open test base must be creatable");
+
+    let target = base.join("unknown-dc.log");
+    let _ = fs::remove_file(&target);
+
+    {
+        let mut file = open_unknown_dc_log_append(&target)
+            .expect("regular target must be creatable with append open");
+        writeln!(file, "dc_idx=1234").expect("append write must succeed");
+    }
+
+    let meta = fs::symlink_metadata(&target).expect("created target metadata must be readable");
+    assert!(meta.file_type().is_file(), "target must be a regular file");
+    assert!(
+        !meta.file_type().is_symlink(),
+        "regular target open path must not produce symlink artifacts"
+    );
+}
+
+#[test]
+fn stress_unknown_dc_open_append_regular_file_preserves_line_integrity() {
+    let base = std::env::current_dir()
+        .expect("cwd must be available")
+        .join("target")
+        .join(format!("telemt-unknown-dc-open-stress-{}", std::process::id()));
+    fs::create_dir_all(&base).expect("stress open base must be creatable");
+
+    let target = base.join("unknown-dc.log");
+    let _ = fs::remove_file(&target);
+
+    let writes = 2048usize;
+    for idx in 0..writes {
+        let mut file = open_unknown_dc_log_append(&target)
+            .expect("stress append open on regular file must succeed");
+        writeln!(file, "dc_idx={idx}").expect("stress append write must succeed");
+    }
+
+    let content = fs::read_to_string(&target).expect("stress output file must be readable");
+    assert_eq!(
+        nonempty_line_count(&content),
+        writes,
+        "regular-file append stress must preserve one logical line per write"
+    );
+}
+
+#[test]
+fn unknown_dc_log_path_revalidation_accepts_regular_existing_target() {
+    let base = std::env::current_dir()
+        .expect("cwd must be available")
+        .join("target")
+        .join(format!("telemt-unknown-dc-safe-target-{}", std::process::id()));
+    fs::create_dir_all(&base).expect("safe target base must be creatable");
+
+    let target = base.join("unknown-dc.log");
+    fs::write(&target, "seed\n").expect("safe target seed write must succeed");
+
+    let rel_candidate = format!(
+        "target/telemt-unknown-dc-safe-target-{}/unknown-dc.log",
+        std::process::id()
+    );
+    let sanitized = sanitize_unknown_dc_log_path(&rel_candidate)
+        .expect("safe candidate must sanitize");
+    assert!(
+        unknown_dc_log_path_is_still_safe(&sanitized),
+        "revalidation must allow safe existing regular files"
+    );
+}
+
+#[test]
+fn unknown_dc_log_path_revalidation_rejects_deleted_parent_after_sanitize() {
+    let base = std::env::current_dir()
+        .expect("cwd must be available")
+        .join("target")
+        .join(format!("telemt-unknown-dc-vanish-parent-{}", std::process::id()));
+    fs::create_dir_all(&base).expect("vanish-parent base must be creatable");
+
+    let rel_candidate = format!(
+        "target/telemt-unknown-dc-vanish-parent-{}/unknown-dc.log",
+        std::process::id()
+    );
+    let sanitized = sanitize_unknown_dc_log_path(&rel_candidate)
+        .expect("candidate must sanitize before parent deletion");
+
+    fs::remove_dir_all(&base).expect("test parent directory must be removable");
+    assert!(
+        !unknown_dc_log_path_is_still_safe(&sanitized),
+        "revalidation must fail when sanitized parent disappears before write"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn unknown_dc_log_path_revalidation_rejects_parent_swapped_to_symlink() {
+    use std::os::unix::fs::symlink;
+
+    let parent = std::env::current_dir()
+        .expect("cwd must be available")
+        .join("target")
+        .join(format!("telemt-unknown-dc-parent-swap-{}", std::process::id()));
+    fs::create_dir_all(&parent).expect("parent-swap test parent must be creatable");
+
+    let rel_candidate = format!(
+        "target/telemt-unknown-dc-parent-swap-{}/unknown-dc.log",
+        std::process::id()
+    );
+    let sanitized = sanitize_unknown_dc_log_path(&rel_candidate)
+        .expect("candidate must sanitize before parent swap");
+
+    let moved = parent.with_extension("bak");
+    let _ = fs::remove_dir_all(&moved);
+    fs::rename(&parent, &moved).expect("parent must be movable for swap simulation");
+    symlink("/tmp", &parent).expect("symlink replacement for parent must be creatable");
+
+    assert!(
+        !unknown_dc_log_path_is_still_safe(&sanitized),
+        "revalidation must fail when canonical parent is swapped to a symlinked target"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn adversarial_check_then_symlink_flip_is_blocked_by_nofollow_open() {
+    use std::os::unix::fs::symlink;
+
+    let parent = std::env::current_dir()
+        .expect("cwd must be available")
+        .join("target")
+        .join(format!("telemt-unknown-dc-check-open-race-{}", std::process::id()));
+    fs::create_dir_all(&parent).expect("check-open-race parent must be creatable");
+
+    let target = parent.join("unknown-dc.log");
+    fs::write(&target, "seed\n").expect("seed target file must be writable");
+    let rel_candidate = format!(
+        "target/telemt-unknown-dc-check-open-race-{}/unknown-dc.log",
+        std::process::id()
+    );
+    let sanitized = sanitize_unknown_dc_log_path(&rel_candidate)
+        .expect("candidate must sanitize");
+
+    assert!(
+        unknown_dc_log_path_is_still_safe(&sanitized),
+        "precondition: target should initially pass revalidation"
+    );
+
+    let outside = std::env::temp_dir().join(format!(
+        "telemt-unknown-dc-check-open-race-outside-{}.log",
+        std::process::id()
+    ));
+    fs::write(&outside, "outside\n").expect("outside file must be writable");
+    fs::remove_file(&target).expect("target removal before flip must succeed");
+    symlink(&outside, &target).expect("target symlink flip must be creatable");
+
+    let err = open_unknown_dc_log_append(&sanitized.resolved_path)
+        .expect_err("nofollow open must fail after symlink flip between check and open");
+    assert_eq!(
+        err.raw_os_error(),
+        Some(libc::ELOOP),
+        "symlink flip in check/open window must be neutralized by O_NOFOLLOW"
     );
 }
 
@@ -496,6 +790,53 @@ async fn unknown_dc_distinct_burst_is_hard_capped_on_file_writes() {
     assert!(
         line_count <= UNKNOWN_DC_LOG_DISTINCT_LIMIT,
         "distinct unknown-dc writes must stay within dedup hard cap"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unknown_dc_symlinked_target_escape_is_not_written_integration() {
+    use std::os::unix::fs::symlink;
+
+    let _guard = unknown_dc_test_lock()
+        .lock()
+        .expect("unknown dc test lock must be available");
+    clear_unknown_dc_log_cache_for_testing();
+
+    let base = std::env::current_dir()
+        .expect("cwd must be available")
+        .join("target")
+        .join(format!("telemt-unknown-dc-no-write-link-{}", std::process::id()));
+    fs::create_dir_all(&base).expect("integration symlink base must be creatable");
+
+    let outside = std::env::temp_dir().join(format!(
+        "telemt-unknown-dc-outside-{}.log",
+        std::process::id()
+    ));
+    fs::write(&outside, "baseline\n").expect("outside baseline file must be writable");
+
+    let linked_target = base.join("unknown-dc.log");
+    let _ = fs::remove_file(&linked_target);
+    symlink(&outside, &linked_target).expect("symlink target must be creatable");
+
+    let rel_file = format!(
+        "target/telemt-unknown-dc-no-write-link-{}/unknown-dc.log",
+        std::process::id()
+    );
+    let dc_idx: i16 = 31_050;
+
+    let mut cfg = ProxyConfig::default();
+    cfg.general.unknown_dc_file_log_enabled = true;
+    cfg.general.unknown_dc_log_path = Some(rel_file);
+
+    let before = fs::read_to_string(&outside).expect("must read baseline outside file");
+    let _ = get_dc_addr_static(dc_idx, &cfg).expect("fallback routing must still work");
+    tokio::time::sleep(Duration::from_millis(80)).await;
+    let after = fs::read_to_string(&outside).expect("must read outside file after attempt");
+
+    assert_eq!(
+        after, before,
+        "symlink target escape must not be written by unknown-DC logging"
     );
 }
 

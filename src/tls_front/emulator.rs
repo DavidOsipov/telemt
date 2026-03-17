@@ -103,7 +103,7 @@ pub fn build_emulated_server_hello(
     cached: &CachedTlsData,
     use_full_cert_payload: bool,
     rng: &SecureRandom,
-    alpn: Option<Vec<u8>>,
+    _alpn: Option<Vec<u8>>,
     new_session_tickets: u8,
 ) -> Vec<u8> {
     // --- ServerHello ---
@@ -117,15 +117,6 @@ pub fn build_emulated_server_hello(
     extensions.extend_from_slice(&0x002bu16.to_be_bytes());
     extensions.extend_from_slice(&(2u16).to_be_bytes());
     extensions.extend_from_slice(&0x0304u16.to_be_bytes());
-    if let Some(alpn_proto) = &alpn {
-        extensions.extend_from_slice(&0x0010u16.to_be_bytes());
-        let list_len: u16 = 1 + alpn_proto.len() as u16;
-        let ext_len: u16 = 2 + list_len;
-        extensions.extend_from_slice(&ext_len.to_be_bytes());
-        extensions.extend_from_slice(&list_len.to_be_bytes());
-        extensions.push(alpn_proto.len() as u8);
-        extensions.extend_from_slice(alpn_proto);
-    }
     let extensions_len = extensions.len() as u16;
 
     let body_len = 2 + // version

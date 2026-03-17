@@ -1539,7 +1539,7 @@ fn auth_probe_capacity_fresh_full_map_still_tracks_newcomer_with_bounded_evictio
 fn stress_auth_probe_full_map_churn_keeps_bound_and_tracks_newcomers() {
     let _guard = auth_probe_test_lock()
         .lock()
-        .expect("auth probe test lock must be available");
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     clear_auth_probe_state_for_testing();
 
     let state = DashMap::new();
@@ -1580,6 +1580,197 @@ fn stress_auth_probe_full_map_churn_keeps_bound_and_tracks_newcomers() {
             state.len(),
             AUTH_PROBE_TRACK_MAX_ENTRIES,
             "auth probe map size must stay hard-bounded at capacity"
+        );
+    }
+}
+
+#[test]
+fn auth_probe_capacity_prefers_evicting_low_fail_streak_entries_first() {
+    let _guard = auth_probe_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    clear_auth_probe_state_for_testing();
+
+    let state = DashMap::new();
+    let now = Instant::now();
+
+    // Fill map at capacity with mostly high fail streak entries.
+    for idx in 0..AUTH_PROBE_TRACK_MAX_ENTRIES {
+        let ip = IpAddr::V4(Ipv4Addr::new(
+            172,
+            20,
+            ((idx >> 8) & 0xff) as u8,
+            (idx & 0xff) as u8,
+        ));
+        state.insert(
+            ip,
+            AuthProbeState {
+                fail_streak: 9,
+                blocked_until: now,
+                last_seen: now + Duration::from_millis(idx as u64 + 1),
+            },
+        );
+    }
+
+    let low_fail = IpAddr::V4(Ipv4Addr::new(172, 21, 0, 1));
+    state.insert(
+        low_fail,
+        AuthProbeState {
+            fail_streak: 1,
+            blocked_until: now,
+            last_seen: now + Duration::from_secs(30),
+        },
+    );
+
+    let high_fail_old = IpAddr::V4(Ipv4Addr::new(172, 21, 0, 2));
+    state.insert(
+        high_fail_old,
+        AuthProbeState {
+            fail_streak: 12,
+            blocked_until: now,
+            last_seen: now - Duration::from_secs(10),
+        },
+    );
+
+    let newcomer = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 201));
+    auth_probe_record_failure_with_state(&state, newcomer, now);
+
+    assert!(state.get(&newcomer).is_some(), "new source must be tracked");
+    assert!(
+        state.get(&low_fail).is_none(),
+        "least-penalized entry should be evicted before high-penalty entries"
+    );
+    assert!(
+        state.get(&high_fail_old).is_some(),
+        "high fail-streak entry should be preserved under mixed-priority eviction"
+    );
+}
+
+#[test]
+fn auth_probe_capacity_tie_breaker_evicts_oldest_with_equal_fail_streak() {
+    let _guard = auth_probe_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    clear_auth_probe_state_for_testing();
+
+    let state = DashMap::new();
+    let now = Instant::now();
+
+    for idx in 0..(AUTH_PROBE_TRACK_MAX_ENTRIES - 2) {
+        let ip = IpAddr::V4(Ipv4Addr::new(
+            172,
+            30,
+            ((idx >> 8) & 0xff) as u8,
+            (idx & 0xff) as u8,
+        ));
+        state.insert(
+            ip,
+            AuthProbeState {
+                fail_streak: 5,
+                blocked_until: now,
+                last_seen: now + Duration::from_millis(idx as u64 + 1),
+            },
+        );
+    }
+
+    let oldest = IpAddr::V4(Ipv4Addr::new(172, 31, 0, 1));
+    let newer = IpAddr::V4(Ipv4Addr::new(172, 31, 0, 2));
+    state.insert(
+        oldest,
+        AuthProbeState {
+            fail_streak: 1,
+            blocked_until: now,
+            last_seen: now - Duration::from_secs(20),
+        },
+    );
+    state.insert(
+        newer,
+        AuthProbeState {
+            fail_streak: 1,
+            blocked_until: now,
+            last_seen: now - Duration::from_secs(5),
+        },
+    );
+
+    let newcomer = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 202));
+    auth_probe_record_failure_with_state(&state, newcomer, now);
+
+    assert!(state.get(&newcomer).is_some(), "new source must be tracked");
+    assert!(
+        state.get(&oldest).is_none(),
+        "among equal fail streak candidates, oldest entry must be evicted"
+    );
+    assert!(
+        state.get(&newer).is_some(),
+        "newer equal-priority entry should be retained"
+    );
+}
+
+#[test]
+fn stress_auth_probe_capacity_churn_preserves_high_fail_sentinels() {
+    let _guard = auth_probe_test_lock()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    clear_auth_probe_state_for_testing();
+
+    let state = DashMap::new();
+    let base_now = Instant::now();
+
+    let sentinel_a = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 250));
+    let sentinel_b = IpAddr::V4(Ipv4Addr::new(198, 51, 100, 251));
+
+    state.insert(
+        sentinel_a,
+        AuthProbeState {
+            fail_streak: 20,
+            blocked_until: base_now,
+            last_seen: base_now - Duration::from_secs(30),
+        },
+    );
+    state.insert(
+        sentinel_b,
+        AuthProbeState {
+            fail_streak: 21,
+            blocked_until: base_now,
+            last_seen: base_now - Duration::from_secs(31),
+        },
+    );
+
+    for idx in 0..(AUTH_PROBE_TRACK_MAX_ENTRIES - 2) {
+        let ip = IpAddr::V4(Ipv4Addr::new(
+            10,
+            4,
+            ((idx >> 8) & 0xff) as u8,
+            (idx & 0xff) as u8,
+        ));
+        state.insert(
+            ip,
+            AuthProbeState {
+                fail_streak: 1,
+                blocked_until: base_now,
+                last_seen: base_now + Duration::from_millis((idx % 1024) as u64),
+            },
+        );
+    }
+
+    for step in 0..1024usize {
+        let newcomer = IpAddr::V4(Ipv4Addr::new(
+            203,
+            1,
+            ((step >> 8) & 0xff) as u8,
+            (step & 0xff) as u8,
+        ));
+        let now = base_now + Duration::from_millis(10_000 + step as u64);
+        auth_probe_record_failure_with_state(&state, newcomer, now);
+
+        assert_eq!(
+            state.len(),
+            AUTH_PROBE_TRACK_MAX_ENTRIES,
+            "auth probe map must remain hard-bounded at capacity"
+        );
+        assert!(
+            state.get(&sentinel_a).is_some() && state.get(&sentinel_b).is_some(),
+            "high fail-streak sentinels should survive low-streak newcomer churn"
         );
     }
 }
@@ -1672,6 +1863,97 @@ fn auth_probe_eviction_offset_varies_with_input() {
 
     assert_eq!(a, b, "same input must yield deterministic offset");
     assert_ne!(a, c, "different peer IPs should not collapse to one offset");
+}
+
+#[test]
+fn auth_probe_eviction_offset_changes_with_time_component() {
+    let ip = IpAddr::V4(Ipv4Addr::new(203, 0, 113, 77));
+    let now = Instant::now();
+    let later = now + Duration::from_millis(1);
+
+    let a = auth_probe_eviction_offset(ip, now);
+    let b = auth_probe_eviction_offset(ip, later);
+
+    assert_ne!(
+        a, b,
+        "eviction offset must incorporate timestamp entropy and not only peer IP"
+    );
+}
+
+#[test]
+fn light_fuzz_auth_probe_eviction_offset_is_deterministic_per_input_pair() {
+    let mut rng = StdRng::seed_from_u64(0xA11CE5EED);
+    let base = Instant::now();
+
+    for _ in 0..4096usize {
+        let ip = IpAddr::V4(Ipv4Addr::new(rng.random(), rng.random(), rng.random(), rng.random()));
+        let offset_ns = rng.random_range(0_u64..2_000_000);
+        let when = base + Duration::from_nanos(offset_ns);
+
+        let first = auth_probe_eviction_offset(ip, when);
+        let second = auth_probe_eviction_offset(ip, when);
+        assert_eq!(
+            first, second,
+            "eviction offset must be stable for identical (ip, now) pairs"
+        );
+    }
+}
+
+#[test]
+fn adversarial_eviction_offset_spread_avoids_single_bucket_collapse() {
+    let modulus = AUTH_PROBE_TRACK_MAX_ENTRIES;
+    let mut bucket_hits = vec![0usize; modulus];
+    let now = Instant::now();
+
+    for idx in 0..8192usize {
+        let ip = IpAddr::V4(Ipv4Addr::new(
+            100,
+            ((idx >> 8) & 0xff) as u8,
+            (idx & 0xff) as u8,
+            ((idx.wrapping_mul(37)) & 0xff) as u8,
+        ));
+        let bucket = auth_probe_eviction_offset(ip, now) % modulus;
+        bucket_hits[bucket] += 1;
+    }
+
+    let non_empty_buckets = bucket_hits.iter().filter(|&&hits| hits > 0).count();
+    assert!(
+        non_empty_buckets >= modulus / 2,
+        "adversarial sequential input should cover a broad bucket set (covered {non_empty_buckets}/{modulus})"
+    );
+
+    let max_hits = bucket_hits.iter().copied().max().unwrap_or(0);
+    let min_non_zero_hits = bucket_hits
+        .iter()
+        .copied()
+        .filter(|&hits| hits > 0)
+        .min()
+        .unwrap_or(0);
+    assert!(
+        max_hits <= min_non_zero_hits.saturating_mul(32).max(1),
+        "bucket skew is unexpectedly extreme for keyed hasher spread (max={max_hits}, min_non_zero={min_non_zero_hits})"
+    );
+}
+
+#[test]
+fn stress_auth_probe_eviction_offset_high_volume_uniqueness_sanity() {
+    let now = Instant::now();
+    let mut seen = std::collections::HashSet::new();
+
+    for idx in 0..50_000usize {
+        let ip = IpAddr::V4(Ipv4Addr::new(
+            198,
+            ((idx >> 16) & 0xff) as u8,
+            ((idx >> 8) & 0xff) as u8,
+            (idx & 0xff) as u8,
+        ));
+        seen.insert(auth_probe_eviction_offset(ip, now));
+    }
+
+    assert!(
+        seen.len() >= 40_000,
+        "high-volume eviction offsets should not collapse excessively under keyed hashing"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

@@ -11,9 +11,8 @@ use crate::crypto::{sha256_hmac, SecureRandom};
 use crate::error::ProxyError;
 use super::constants::*;
 use std::time::{SystemTime, UNIX_EPOCH};
-use num_bigint::BigUint;
-use num_traits::One;
 use subtle::ConstantTimeEq;
+use x25519_dalek::{X25519_BASEPOINT_BYTES, x25519};
 
 // ============= Public Constants =============
 
@@ -121,27 +120,6 @@ impl TlsExtensionBuilder {
         self
     }
 
-    /// Add ALPN extension with a single selected protocol.
-    fn add_alpn(&mut self, proto: &[u8]) -> &mut Self {
-        // Extension type: ALPN (0x0010)
-        self.extensions.extend_from_slice(&extension_type::ALPN.to_be_bytes());
-
-        // ALPN extension format:
-        // extension_data length (2 bytes)
-        //   protocols length (2 bytes)
-        //     protocol name length (1 byte)
-        //     protocol name bytes
-        let proto_len = proto.len() as u8;
-        let list_len: u16 = 1 + u16::from(proto_len);
-        let ext_len: u16 = 2 + list_len;
-
-        self.extensions.extend_from_slice(&ext_len.to_be_bytes());
-        self.extensions.extend_from_slice(&list_len.to_be_bytes());
-        self.extensions.push(proto_len);
-        self.extensions.extend_from_slice(proto);
-        self
-    }
-    
     /// Build final extensions with length prefix
     fn build(self) -> Vec<u8> {
         let mut result = Vec::with_capacity(2 + self.extensions.len());
@@ -177,8 +155,6 @@ struct ServerHelloBuilder {
     compression: u8,
     /// Extensions
     extensions: TlsExtensionBuilder,
-    /// Selected ALPN protocol (if any)
-    alpn: Option<Vec<u8>>,
 }
 
 impl ServerHelloBuilder {
@@ -189,7 +165,6 @@ impl ServerHelloBuilder {
             cipher_suite: cipher_suite::TLS_AES_128_GCM_SHA256,
             compression: 0x00,
             extensions: TlsExtensionBuilder::new(),
-            alpn: None,
         }
     }
     
@@ -204,18 +179,9 @@ impl ServerHelloBuilder {
         self
     }
 
-    fn with_alpn(mut self, proto: Option<Vec<u8>>) -> Self {
-        self.alpn = proto;
-        self
-    }
-    
     /// Build ServerHello message (without record header)
     fn build_message(&self) -> Vec<u8> {
-        let mut ext_builder = self.extensions.clone();
-        if let Some(ref alpn) = self.alpn {
-            ext_builder.add_alpn(alpn);
-        }
-        let extensions = ext_builder.extensions.clone();
+        let extensions = self.extensions.extensions.clone();
         let extensions_len = extensions.len() as u16;
         
         // Calculate total length
@@ -380,6 +346,9 @@ fn validate_tls_handshake_at_time_with_boot_cap(
     // Extract session ID
     let session_id_len_pos = TLS_DIGEST_POS + TLS_DIGEST_LEN;
     let session_id_len = handshake.get(session_id_len_pos).copied()? as usize;
+    if session_id_len > 32 {
+        return None;
+    }
     let session_id_start = session_id_len_pos + 1;
     
     if handshake.len() < session_id_start + session_id_len {
@@ -444,27 +413,14 @@ fn validate_tls_handshake_at_time_with_boot_cap(
     })
 }
 
-fn curve25519_prime() -> BigUint {
-    (BigUint::one() << 255) - BigUint::from(19u32)
-}
-
 /// Generate a fake X25519 public key for TLS
 ///
-/// Produces a quadratic residue mod p = 2^255 - 19 by computing n² mod p,
-/// which matches Python/C behavior and avoids DPI fingerprinting.
+/// Uses RFC 7748 X25519 scalar multiplication over the canonical basepoint,
+/// yielding distribution-consistent public keys for anti-fingerprinting.
 pub fn gen_fake_x25519_key(rng: &SecureRandom) -> [u8; 32] {
-    let mut n_bytes = [0u8; 32];
-    n_bytes.copy_from_slice(&rng.bytes(32));
-
-    let n = BigUint::from_bytes_le(&n_bytes);
-    let p = curve25519_prime();
-    let pk = (&n * &n) % &p;
-
-    let mut out = pk.to_bytes_le();
-    out.resize(32, 0);
-    let mut result = [0u8; 32];
-    result.copy_from_slice(&out[..32]);
-    result
+    let mut scalar = [0u8; 32];
+    scalar.copy_from_slice(&rng.bytes(32));
+    x25519(scalar, X25519_BASEPOINT_BYTES)
 }
 
 /// Build TLS ServerHello response
@@ -481,7 +437,7 @@ pub fn build_server_hello(
     session_id: &[u8],
     fake_cert_len: usize,
     rng: &SecureRandom,
-    alpn: Option<Vec<u8>>,
+    _alpn: Option<Vec<u8>>,
     new_session_tickets: u8,
 ) -> Vec<u8> {
     const MIN_APP_DATA: usize = 64;
@@ -493,7 +449,6 @@ pub fn build_server_hello(
     let server_hello = ServerHelloBuilder::new(session_id.to_vec())
         .with_x25519_key(&x25519_key)
         .with_tls13_version()
-        .with_alpn(alpn)
         .build_record();
     
     // Build Change Cipher Spec record
