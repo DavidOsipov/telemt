@@ -606,3 +606,10 @@ where
         }
     }
 }
+
+#[cfg(test)]
+#[path = "relay_security_tests.rs"]
+mod security_tests;
+#[cfg(test)]
+#[path = "relay_adversarial_tests.rs"]
+mod adversarial_tests;

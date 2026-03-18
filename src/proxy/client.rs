@@ -864,3 +864,10 @@ impl RunningClientHandler {
         Ok(())
     }
 }
+
+#[cfg(test)]
+#[path = "client_security_tests.rs"]
+mod security_tests;
+#[cfg(test)]
+#[path = "client_adversarial_tests.rs"]
+mod adversarial_tests;

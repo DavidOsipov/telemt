@@ -506,3 +506,25 @@ mod tests {
         // Drop impl zeroizes key material without panic
     }
 }
+
+#[cfg(test)]
+#[path = "handshake_security_tests.rs"]
+mod security_tests;
+
+#[cfg(test)]
+#[path = "handshake_adversarial_tests.rs"]
+mod adversarial_tests;
+
+#[cfg(test)]
+#[path = "handshake_fuzz_security_tests.rs"]
+mod fuzz_security_tests;
+
+/// Compile-time guard: HandshakeSuccess holds cryptographic key material and
+/// must never be Copy.  A Copy impl would allow silent key duplication,
+/// undermining the zeroize-on-drop guarantee.
+mod compile_time_security_checks {
+    use super::HandshakeSuccess;
+    use static_assertions::assert_not_impl_all;
+
+    assert_not_impl_all!(HandshakeSuccess: Copy, Clone);
+}

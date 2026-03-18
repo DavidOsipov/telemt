@@ -955,3 +955,15 @@ mod tests {
         assert_eq!(alpn_str, vec!["h2", "spdy", "h3"]);
     }
 }
+
+#[cfg(test)]
+#[path = "tls_security_tests.rs"]
+mod security_tests;
+
+#[cfg(test)]
+#[path = "tls_adversarial_tests.rs"]
+mod adversarial_tests;
+
+#[cfg(test)]
+#[path = "tls_fuzz_security_tests.rs"]
+mod fuzz_security_tests;
