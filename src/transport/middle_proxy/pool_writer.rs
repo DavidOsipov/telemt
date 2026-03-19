@@ -42,10 +42,11 @@ impl MePool {
         }
 
         for writer_id in closed_writer_ids {
-            if self.remove_writer_if_empty(writer_id).await {
-                continue;
+            if self.registry.is_writer_empty(writer_id).await {
+                let _ = self.remove_writer_only(writer_id).await;
+            } else {
+                let _ = self.remove_writer_and_close_clients(writer_id).await;
             }
-            let _ = self.remove_writer_and_close_clients(writer_id).await;
         }
     }
 
@@ -311,41 +312,28 @@ impl MePool {
                 let mut p = Vec::with_capacity(12);
                 p.extend_from_slice(&RPC_PING_U32.to_le_bytes());
                 p.extend_from_slice(&sent_id.to_le_bytes());
-                {
-                    let mut tracker = ping_tracker_ping.lock().await;
-                    let now_epoch_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-                    let mut run_cleanup = false;
-                    if let Some(pool) = pool_ping.upgrade() {
-                        let last_cleanup_ms = pool
+                let now_epoch_ms = std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as u64;
+                let mut run_cleanup = false;
+                if let Some(pool) = pool_ping.upgrade() {
+                    let last_cleanup_ms = pool
+                        .ping_tracker_last_cleanup_epoch_ms
+                        .load(Ordering::Relaxed);
+                    if now_epoch_ms.saturating_sub(last_cleanup_ms) >= 30_000
+                        && pool
                             .ping_tracker_last_cleanup_epoch_ms
-                            .load(Ordering::Relaxed);
-                        if now_epoch_ms.saturating_sub(last_cleanup_ms) >= 30_000
-                            && pool
-                                .ping_tracker_last_cleanup_epoch_ms
-                                .compare_exchange(
-                                    last_cleanup_ms,
-                                    now_epoch_ms,
-                                    Ordering::AcqRel,
-                                    Ordering::Relaxed,
-                                )
-                                .is_ok()
-                        {
-                            run_cleanup = true;
-                        }
+                            .compare_exchange(
+                                last_cleanup_ms,
+                                now_epoch_ms,
+                                Ordering::AcqRel,
+                                Ordering::Relaxed,
+                            )
+                            .is_ok()
+                    {
+                        run_cleanup = true;
                     }
-
-                    if run_cleanup {
-                        let before = tracker.len();
-                        tracker.retain(|_, (ts, _)| ts.elapsed() < Duration::from_secs(120));
-                        let expired = before.saturating_sub(tracker.len());
-                        if expired > 0 {
-                            stats_ping.increment_me_keepalive_timeout_by(expired as u64);
-                        }
-                    }
-                    tracker.insert(sent_id, (std::time::Instant::now(), writer_id));
                 }
                 ping_id = ping_id.wrapping_add(1);
                 stats_ping.increment_me_keepalive_sent();
@@ -366,6 +354,16 @@ impl MePool {
                     }
                     break;
                 }
+                let mut tracker = ping_tracker_ping.lock().await;
+                if run_cleanup {
+                    let before = tracker.len();
+                    tracker.retain(|_, (ts, _)| ts.elapsed() < Duration::from_secs(120));
+                    let expired = before.saturating_sub(tracker.len());
+                    if expired > 0 {
+                        stats_ping.increment_me_keepalive_timeout_by(expired as u64);
+                    }
+                }
+                tracker.insert(sent_id, (std::time::Instant::now(), writer_id));
             }
         });
 
@@ -500,17 +498,6 @@ impl MePool {
         }
     }
 
-    pub(crate) async fn remove_writer_if_empty(self: &Arc<Self>, writer_id: u64) -> bool {
-        if !self.registry.unregister_writer_if_empty(writer_id).await {
-            return false;
-        }
-
-        // The registry empty-check and unregister are atomic with respect to binds,
-        // so remove_writer_only cannot return active bound sessions here.
-        let _ = self.remove_writer_only(writer_id).await;
-        true
-    }
-
     async fn remove_writer_only(self: &Arc<Self>, writer_id: u64) -> Vec<BoundConn> {
         let mut close_tx: Option<mpsc::Sender<WriterCommand>> = None;
         let mut removed_addr: Option<SocketAddr> = None;
@@ -524,7 +511,6 @@ impl MePool {
                 let was_draining = w.draining.load(Ordering::Relaxed);
                 if was_draining {
                     self.stats.decrement_pool_drain_active();
-                    self.decrement_draining_active_runtime();
                 }
                 self.stats.increment_me_writer_removed_total();
                 w.cancel.cancel();
@@ -583,7 +569,6 @@ impl MePool {
                     .store(drain_deadline_epoch_secs, Ordering::Relaxed);
                 if !already_draining {
                     self.stats.increment_pool_drain_active();
-                    self.increment_draining_active_runtime();
                 }
                 w.contour
                     .store(WriterContour::Draining.as_u8(), Ordering::Relaxed);

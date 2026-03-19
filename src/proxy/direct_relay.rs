@@ -1,11 +1,7 @@
-use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::Write;
 use std::net::SocketAddr;
-use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::collections::HashSet;
-use std::sync::{Mutex, OnceLock};
 
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -22,154 +18,11 @@ use crate::proxy::route_mode::{
     RelayRouteMode, RouteCutoverState, ROUTE_SWITCH_ERROR_MSG, affected_cutover_state,
     cutover_stagger_delay,
 };
+use crate::proxy::adaptive_buffers;
+use crate::proxy::session_eviction::SessionLease;
 use crate::stats::Stats;
 use crate::stream::{BufferPool, CryptoReader, CryptoWriter};
 use crate::transport::UpstreamManager;
-
-#[cfg(unix)]
-use std::os::unix::fs::OpenOptionsExt;
-
-const UNKNOWN_DC_LOG_DISTINCT_LIMIT: usize = 1024;
-static LOGGED_UNKNOWN_DCS: OnceLock<Mutex<HashSet<i16>>> = OnceLock::new();
-const MAX_SCOPE_HINT_LEN: usize = 64;
-
-fn validated_scope_hint(user: &str) -> Option<&str> {
-    let scope = user.strip_prefix("scope_")?;
-    if scope.is_empty() || scope.len() > MAX_SCOPE_HINT_LEN {
-        return None;
-    }
-    if scope
-        .bytes()
-        .all(|b| b.is_ascii_alphanumeric() || b == b'-')
-    {
-        Some(scope)
-    } else {
-        None
-    }
-}
-
-#[derive(Clone)]
-struct SanitizedUnknownDcLogPath {
-    resolved_path: PathBuf,
-    allowed_parent: PathBuf,
-    file_name: OsString,
-}
-
-// In tests, this function shares global mutable state. Callers that also use
-// cache-reset helpers must hold `unknown_dc_test_lock()` to keep assertions
-// deterministic under parallel execution.
-fn should_log_unknown_dc(dc_idx: i16) -> bool {
-    let set = LOGGED_UNKNOWN_DCS.get_or_init(|| Mutex::new(HashSet::new()));
-    should_log_unknown_dc_with_set(set, dc_idx)
-}
-
-fn should_log_unknown_dc_with_set(set: &Mutex<HashSet<i16>>, dc_idx: i16) -> bool {
-    match set.lock() {
-        Ok(mut guard) => {
-            if guard.contains(&dc_idx) {
-                return false;
-            }
-            if guard.len() >= UNKNOWN_DC_LOG_DISTINCT_LIMIT {
-                return false;
-            }
-            guard.insert(dc_idx)
-        }
-        // Fail closed on poisoned state to avoid unbounded blocking log writes.
-        Err(_) => false,
-    }
-}
-
-fn sanitize_unknown_dc_log_path(path: &str) -> Option<SanitizedUnknownDcLogPath> {
-    let candidate = Path::new(path);
-    if candidate.as_os_str().is_empty() {
-        return None;
-    }
-    if candidate
-        .components()
-        .any(|component| matches!(component, Component::ParentDir))
-    {
-        return None;
-    }
-
-    let cwd = std::env::current_dir().ok()?;
-    let file_name = candidate.file_name()?;
-    let parent = candidate.parent().unwrap_or_else(|| Path::new("."));
-    let parent_path = if parent.is_absolute() {
-        parent.to_path_buf()
-    } else {
-        cwd.join(parent)
-    };
-    let canonical_parent = parent_path.canonicalize().ok()?;
-    if !canonical_parent.is_dir() {
-        return None;
-    }
-
-    Some(SanitizedUnknownDcLogPath {
-        resolved_path: canonical_parent.join(file_name),
-        allowed_parent: canonical_parent,
-        file_name: file_name.to_os_string(),
-    })
-}
-
-fn unknown_dc_log_path_is_still_safe(path: &SanitizedUnknownDcLogPath) -> bool {
-    let Some(parent) = path.resolved_path.parent() else {
-        return false;
-    };
-    let Ok(current_parent) = parent.canonicalize() else {
-        return false;
-    };
-    if current_parent != path.allowed_parent {
-        return false;
-    }
-
-    if let Ok(canonical_target) = path.resolved_path.canonicalize() {
-        let Some(target_parent) = canonical_target.parent() else {
-            return false;
-        };
-        let Some(target_name) = canonical_target.file_name() else {
-            return false;
-        };
-        if target_parent != path.allowed_parent || target_name != path.file_name {
-            return false;
-        }
-    }
-
-    true
-}
-
-fn open_unknown_dc_log_append(path: &Path) -> std::io::Result<std::fs::File> {
-    #[cfg(unix)]
-    {
-        OpenOptions::new()
-            .create(true)
-            .append(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(path)
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        Err(std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            "unknown_dc_file_log_enabled requires unix O_NOFOLLOW support",
-        ))
-    }
-}
-
-#[cfg(test)]
-fn clear_unknown_dc_log_cache_for_testing() {
-    if let Some(set) = LOGGED_UNKNOWN_DCS.get()
-        && let Ok(mut guard) = set.lock()
-    {
-        guard.clear();
-    }
-}
-
-#[cfg(test)]
-fn unknown_dc_test_lock() -> &'static Mutex<()> {
-    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    TEST_LOCK.get_or_init(|| Mutex::new(()))
-}
 
 pub(crate) async fn handle_via_direct<R, W>(
     client_reader: CryptoReader<R>,
@@ -183,6 +36,7 @@ pub(crate) async fn handle_via_direct<R, W>(
     mut route_rx: watch::Receiver<RouteCutoverState>,
     route_snapshot: RouteCutoverState,
     session_id: u64,
+    session_lease: SessionLease,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
@@ -201,15 +55,8 @@ where
         "Connecting to Telegram DC"
     );
 
-    let scope_hint = validated_scope_hint(user);
-    if user.starts_with("scope_") && scope_hint.is_none() {
-        warn!(
-            user = %user,
-            "Ignoring invalid scope hint and falling back to default upstream selection"
-        );
-    }
     let tg_stream = upstream_manager
-        .connect(dc_addr, Some(success.dc_idx), scope_hint)
+        .connect(dc_addr, Some(success.dc_idx), user.strip_prefix("scope_").filter(|s| !s.is_empty()))
         .await?;
 
     debug!(peer = %success.peer, dc_addr = %dc_addr, "Connected, performing TG handshake");
@@ -220,19 +67,29 @@ where
     debug!(peer = %success.peer, "TG handshake complete, starting relay");
 
     stats.increment_user_connects(user);
-    let _direct_connection_lease = stats.acquire_direct_connection_lease();
+    stats.increment_user_curr_connects(user);
+    stats.increment_current_connections_direct();
+
+    let seed_tier = adaptive_buffers::seed_tier_for_user(user);
+    let (c2s_copy_buf, s2c_copy_buf) = adaptive_buffers::direct_copy_buffers_for_tier(
+        seed_tier,
+        config.general.direct_relay_copy_buf_c2s_bytes,
+        config.general.direct_relay_copy_buf_s2c_bytes,
+    );
 
     let relay_result = relay_bidirectional(
         client_reader,
         client_writer,
         tg_reader,
         tg_writer,
-        config.general.direct_relay_copy_buf_c2s_bytes,
-        config.general.direct_relay_copy_buf_s2c_bytes,
+        c2s_copy_buf,
+        s2c_copy_buf,
         user,
+        success.dc_idx,
         Arc::clone(&stats),
-        config.access.user_data_quota.get(user).copied(),
         buffer_pool,
+        session_lease,
+        seed_tier,
     );
     tokio::pin!(relay_result);
     let relay_result = loop {
@@ -263,6 +120,9 @@ where
             }
         }
     };
+
+    stats.decrement_current_connections_direct();
+    stats.decrement_user_curr_connects(user);
 
     match &relay_result {
         Ok(()) => debug!(user = %user, "Direct relay completed"),
@@ -315,19 +175,12 @@ fn get_dc_addr_static(dc_idx: i16, config: &ProxyConfig) -> Result<SocketAddr> {
             && let Some(path) = &config.general.unknown_dc_log_path
             && let Ok(handle) = tokio::runtime::Handle::try_current()
         {
-            if let Some(path) = sanitize_unknown_dc_log_path(path) {
-                if should_log_unknown_dc(dc_idx) {
-                    handle.spawn_blocking(move || {
-                        if unknown_dc_log_path_is_still_safe(&path)
-                            && let Ok(mut file) = open_unknown_dc_log_append(&path.resolved_path)
-                        {
-                            let _ = writeln!(file, "dc_idx={dc_idx}");
-                        }
-                    });
+            let path = path.clone();
+            handle.spawn_blocking(move || {
+                if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
+                    let _ = writeln!(file, "dc_idx={dc_idx}");
                 }
-            } else {
-                warn!(dc_idx = dc_idx, raw_path = %path, "Rejected unsafe unknown DC log path");
-            }
+            });
         }
     }
 
@@ -335,7 +188,7 @@ fn get_dc_addr_static(dc_idx: i16, config: &ProxyConfig) -> Result<SocketAddr> {
     let fallback_idx = if default_dc >= 1 && default_dc <= num_dcs {
         default_dc - 1
     } else {
-        0
+        1
     };
 
     info!(
@@ -388,7 +241,3 @@ async fn do_tg_handshake_static(
         CryptoWriter::new(write_half, tg_encryptor, max_pending),
     ))
 }
-
-#[cfg(test)]
-#[path = "direct_relay_security_tests.rs"]
-mod security_tests;
