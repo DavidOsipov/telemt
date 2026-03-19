@@ -1,40 +1,32 @@
-name: Build telemt for OpenBSD aarch64 (Manual)
+name: Build telemt for OpenBSD aarch64
 
 on:
-  workflow_dispatch: # Исключительно ручной запуск через веб-интерфейс или API
+  workflow_dispatch:
 
 jobs:
   build:
-    runs-on: ubuntu-latest 
-    
+    runs-on: ubuntu-latest
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Compile in OpenBSD VM
-        id: compile
         uses: vmactions/openbsd-vm@v1
         with:
           release: "7.8"
           arch: aarch64
-          mem: 6144
           usesh: true
           sync: sshfs
-          disable-cache: true
+          envs: 'RUSTFLAGS'
           prepare: |
             pkg_add rust
           run: |
-            if ! grep -q 'lto = "thin"' Cargo.toml; then
-              echo '' >> Cargo.toml
-              echo '[profile.release]' >> Cargo.toml
-              echo 'lto = "thin"' >> Cargo.toml
-            fi
-            
-            export RUSTFLAGS="-C target-cpu=cortex-a53 -C target-feature=+aes,+sha2,+crc"
-            
             cargo build --release
+        env:
+          RUSTFLAGS: "-C target-cpu=cortex-a53 -C target-feature=+aes,+pmull,+sha2,+sha1,+crc -C opt-level=3"
 
-      - name: Extract Artifact
+      - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: telemt-openbsd-aarch64
