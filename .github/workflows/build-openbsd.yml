@@ -19,7 +19,8 @@ jobs:
           arch: aarch64
           mem: 6144
           usesh: true
-          sync: rsync
+          sync: sshfs
+          disable-cache: true
           prepare: |
             pkg_add rust
           run: |
