@@ -1101,3 +1101,7 @@ mod tests {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "middle_relay_security_tests.rs"]
+mod security_tests;

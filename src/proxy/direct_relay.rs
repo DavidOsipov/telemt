@@ -243,3 +243,7 @@ async fn do_tg_handshake_static(
         CryptoWriter::new(write_half, tg_encryptor, max_pending),
     ))
 }
+
+#[cfg(test)]
+#[path = "direct_relay_security_tests.rs"]
+mod security_tests;

@@ -140,3 +140,7 @@ pub(crate) fn cutover_stagger_delay(session_id: u64, generation: u64) -> Duratio
     let ms = 1000 + (value % 1000);
     Duration::from_millis(ms)
 }
+
+#[cfg(test)]
+#[path = "route_mode_security_tests.rs"]
+mod security_tests;

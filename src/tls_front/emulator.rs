@@ -427,3 +427,7 @@ mod tests {
         assert_eq!(app_start + 5 + app_len, response.len());
     }
 }
+
+#[cfg(test)]
+#[path = "emulator_security_tests.rs"]
+mod security_tests;

@@ -1851,3 +1851,11 @@ mod tests {
         assert_eq!(checker.stats().total_entries, 500);
     }
 }
+
+#[cfg(test)]
+#[path = "connection_lease_security_tests.rs"]
+mod connection_lease_security_tests;
+
+#[cfg(test)]
+#[path = "replay_checker_security_tests.rs"]
+mod replay_checker_security_tests;
