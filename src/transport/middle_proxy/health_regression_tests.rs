@@ -175,6 +175,21 @@ async fn current_writer_ids(pool: &Arc<MePool>) -> Vec<u64> {
     writer_ids
 }
 
+async fn writer_exists(pool: &Arc<MePool>, writer_id: u64) -> bool {
+    pool.writers
+        .read()
+        .await
+        .iter()
+        .any(|writer| writer.id == writer_id)
+}
+
+async fn set_writer_draining(pool: &Arc<MePool>, writer_id: u64, draining: bool) {
+    let writers = pool.writers.read().await;
+    if let Some(writer) = writers.iter().find(|writer| writer.id == writer_id) {
+        writer.draining.store(draining, Ordering::Relaxed);
+    }
+}
+
 #[tokio::test]
 async fn reap_draining_writers_drops_warn_state_for_removed_writer() {
     let pool = make_pool(128).await;
@@ -267,6 +282,123 @@ async fn reap_draining_writers_limits_closes_per_health_tick() {
     reap_draining_writers(&pool, &mut warn_next_allowed, &mut soft_evict_next_allowed).await;
 
     assert_eq!(pool.writers.read().await.len(), writer_total - close_budget);
+}
+
+#[tokio::test]
+async fn reap_draining_writers_keeps_warn_state_for_deadline_backlog_writers() {
+    let pool = make_pool(0).await;
+    let now_epoch_secs = MePool::now_epoch_secs();
+    let close_budget = health_drain_close_budget();
+    let writer_total = close_budget.saturating_add(5);
+    for writer_id in 1..=writer_total as u64 {
+        insert_draining_writer(
+            &pool,
+            writer_id,
+            now_epoch_secs.saturating_sub(60),
+            1,
+            now_epoch_secs.saturating_sub(1),
+        )
+        .await;
+    }
+    let target_writer_id = writer_total as u64;
+    let mut warn_next_allowed = HashMap::new();
+    warn_next_allowed.insert(
+        target_writer_id,
+        Instant::now() + Duration::from_secs(300),
+    );
+
+    reap_draining_writers(&pool, &mut warn_next_allowed).await;
+
+    assert!(writer_exists(&pool, target_writer_id).await);
+    assert!(warn_next_allowed.contains_key(&target_writer_id));
+}
+
+#[tokio::test]
+async fn reap_draining_writers_keeps_warn_state_for_overflow_backlog_writers() {
+    let pool = make_pool(1).await;
+    let now_epoch_secs = MePool::now_epoch_secs();
+    let close_budget = health_drain_close_budget();
+    let writer_total = close_budget.saturating_add(6);
+    for writer_id in 1..=writer_total as u64 {
+        insert_draining_writer(
+            &pool,
+            writer_id,
+            now_epoch_secs.saturating_sub(300).saturating_add(writer_id),
+            1,
+            0,
+        )
+        .await;
+    }
+    let target_writer_id = writer_total.saturating_sub(1) as u64;
+    let mut warn_next_allowed = HashMap::new();
+    warn_next_allowed.insert(
+        target_writer_id,
+        Instant::now() + Duration::from_secs(300),
+    );
+
+    reap_draining_writers(&pool, &mut warn_next_allowed).await;
+
+    assert!(writer_exists(&pool, target_writer_id).await);
+    assert!(warn_next_allowed.contains_key(&target_writer_id));
+}
+
+#[tokio::test]
+async fn reap_draining_writers_drops_warn_state_when_writer_exits_draining_state() {
+    let pool = make_pool(128).await;
+    let now_epoch_secs = MePool::now_epoch_secs();
+    insert_draining_writer(&pool, 71, now_epoch_secs.saturating_sub(60), 1, 0).await;
+
+    let mut warn_next_allowed = HashMap::new();
+    warn_next_allowed.insert(71, Instant::now() + Duration::from_secs(300));
+
+    set_writer_draining(&pool, 71, false).await;
+    reap_draining_writers(&pool, &mut warn_next_allowed).await;
+
+    assert!(writer_exists(&pool, 71).await);
+    assert!(
+        !warn_next_allowed.contains_key(&71),
+        "warn cooldown state must be dropped after writer leaves draining state"
+    );
+}
+
+#[tokio::test]
+async fn reap_draining_writers_preserves_warn_state_across_multiple_budget_deferrals() {
+    let pool = make_pool(0).await;
+    let now_epoch_secs = MePool::now_epoch_secs();
+    let close_budget = health_drain_close_budget();
+    let writer_total = close_budget.saturating_mul(2).saturating_add(1);
+    for writer_id in 1..=writer_total as u64 {
+        insert_draining_writer(
+            &pool,
+            writer_id,
+            now_epoch_secs.saturating_sub(120),
+            1,
+            now_epoch_secs.saturating_sub(1),
+        )
+        .await;
+    }
+
+    let tail_writer_id = writer_total as u64;
+    let mut warn_next_allowed = HashMap::new();
+    warn_next_allowed.insert(
+        tail_writer_id,
+        Instant::now() + Duration::from_secs(300),
+    );
+
+    reap_draining_writers(&pool, &mut warn_next_allowed).await;
+    assert!(writer_exists(&pool, tail_writer_id).await);
+    assert!(warn_next_allowed.contains_key(&tail_writer_id));
+
+    reap_draining_writers(&pool, &mut warn_next_allowed).await;
+    assert!(writer_exists(&pool, tail_writer_id).await);
+    assert!(warn_next_allowed.contains_key(&tail_writer_id));
+
+    reap_draining_writers(&pool, &mut warn_next_allowed).await;
+    assert!(!writer_exists(&pool, tail_writer_id).await);
+    assert!(
+        !warn_next_allowed.contains_key(&tail_writer_id),
+        "warn cooldown state must clear once writer is actually removed"
+    );
 }
 
 #[tokio::test]
@@ -532,4 +664,68 @@ fn general_config_default_drain_threshold_remains_enabled() {
         GeneralConfig::default().me_pool_drain_soft_evict_per_writer,
         1
     );
+}
+
+#[tokio::test]
+async fn reap_draining_writers_does_not_close_writer_that_became_non_empty_after_snapshot() {
+    let pool = make_pool(128).await;
+    let now_epoch_secs = MePool::now_epoch_secs();
+
+    let empty_writer_id = 700u64;
+    insert_draining_writer(
+        &pool,
+        empty_writer_id,
+        now_epoch_secs.saturating_sub(60),
+        0,
+        0,
+    )
+    .await;
+
+    let stale_empty_snapshot = vec![empty_writer_id];
+    let (rebound_conn_id, _rx) = pool.registry.register().await;
+    assert!(
+        pool.registry
+            .bind_writer(
+                rebound_conn_id,
+                empty_writer_id,
+                ConnMeta {
+                    target_dc: 2,
+                    client_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 9050),
+                    our_addr: SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 443),
+                    proto_flags: 0,
+                },
+            )
+            .await,
+        "writer should accept a new bind after stale empty snapshot"
+    );
+
+    for writer_id in stale_empty_snapshot {
+        assert!(
+            !pool.remove_writer_if_empty(writer_id).await,
+            "atomic empty cleanup must reject writers that gained bound clients"
+        );
+    }
+
+    assert!(
+        writer_exists(&pool, empty_writer_id).await,
+        "empty-path cleanup must not remove a writer that gained a bound client"
+    );
+    assert_eq!(
+        pool.registry.get_writer(rebound_conn_id).await.map(|w| w.writer_id),
+        Some(empty_writer_id)
+    );
+
+    let _ = pool.registry.unregister(rebound_conn_id).await;
+}
+
+#[tokio::test]
+async fn prune_closed_writers_closes_bound_clients_when_writer_is_non_empty() {
+    let pool = make_pool(128).await;
+    let now_epoch_secs = MePool::now_epoch_secs();
+    let conn_ids = insert_draining_writer(&pool, 910, now_epoch_secs.saturating_sub(60), 1, 0).await;
+
+    pool.prune_closed_writers().await;
+
+    assert!(!writer_exists(&pool, 910).await);
+    assert!(pool.registry.get_writer(conn_ids[0]).await.is_none());
 }

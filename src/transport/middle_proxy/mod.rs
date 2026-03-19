@@ -27,6 +27,8 @@ mod health_regression_tests;
 mod health_integration_tests;
 #[cfg(test)]
 mod health_adversarial_tests;
+#[cfg(test)]
+mod send_adversarial_tests;
 
 use bytes::Bytes;
 

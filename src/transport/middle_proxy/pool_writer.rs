@@ -42,11 +42,10 @@ impl MePool {
         }
 
         for writer_id in closed_writer_ids {
-            if self.registry.is_writer_empty(writer_id).await {
-                let _ = self.remove_writer_only(writer_id).await;
-            } else {
-                let _ = self.remove_writer_and_close_clients(writer_id).await;
+            if self.remove_writer_if_empty(writer_id).await {
+                continue;
             }
+            let _ = self.remove_writer_and_close_clients(writer_id).await;
         }
     }
 
@@ -498,6 +497,17 @@ impl MePool {
         }
     }
 
+    pub(crate) async fn remove_writer_if_empty(self: &Arc<Self>, writer_id: u64) -> bool {
+        if !self.registry.unregister_writer_if_empty(writer_id).await {
+            return false;
+        }
+
+        // The registry empty-check and unregister are atomic with respect to binds,
+        // so remove_writer_only cannot return active bound sessions here.
+        let _ = self.remove_writer_only(writer_id).await;
+        true
+    }
+
     async fn remove_writer_only(self: &Arc<Self>, writer_id: u64) -> Vec<BoundConn> {
         let mut close_tx: Option<mpsc::Sender<WriterCommand>> = None;
         let mut removed_addr: Option<SocketAddr> = None;
@@ -511,6 +521,7 @@ impl MePool {
                 let was_draining = w.draining.load(Ordering::Relaxed);
                 if was_draining {
                     self.stats.decrement_pool_drain_active();
+                    self.decrement_draining_active_runtime();
                 }
                 self.stats.increment_me_writer_removed_total();
                 w.cancel.cancel();
@@ -569,6 +580,7 @@ impl MePool {
                     .store(drain_deadline_epoch_secs, Ordering::Relaxed);
                 if !already_draining {
                     self.stats.increment_pool_drain_active();
+                    self.increment_draining_active_runtime();
                 }
                 w.contour
                     .store(WriterContour::Draining.as_u8(), Ordering::Relaxed);

@@ -7,18 +7,89 @@ use tokio::net::TcpStream;
 #[cfg(unix)]
 use tokio::net::UnixStream;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncReadExt, AsyncWriteExt};
-use tokio::time::timeout;
+use tokio::time::{Instant, timeout};
 use tracing::debug;
 use crate::config::ProxyConfig;
 use crate::network::dns_overrides::resolve_socket_addr;
 use crate::stats::beobachten::BeobachtenStore;
 use crate::transport::proxy_protocol::{ProxyProtocolV1Builder, ProxyProtocolV2Builder};
 
+#[cfg(not(test))]
 const MASK_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const MASK_TIMEOUT: Duration = Duration::from_millis(50);
 /// Maximum duration for the entire masking relay.
 /// Limits resource consumption from slow-loris attacks and port scanners.
+#[cfg(not(test))]
 const MASK_RELAY_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const MASK_RELAY_TIMEOUT: Duration = Duration::from_millis(200);
+#[cfg(not(test))]
+const MASK_RELAY_IDLE_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(test)]
+const MASK_RELAY_IDLE_TIMEOUT: Duration = Duration::from_millis(100);
 const MASK_BUFFER_SIZE: usize = 8192;
+
+async fn copy_with_idle_timeout<R, W>(reader: &mut R, writer: &mut W)
+where
+    R: AsyncRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
+    let mut buf = [0u8; MASK_BUFFER_SIZE];
+    loop {
+        let read_res = timeout(MASK_RELAY_IDLE_TIMEOUT, reader.read(&mut buf)).await;
+        let n = match read_res {
+            Ok(Ok(n)) => n,
+            Ok(Err(_)) | Err(_) => break,
+        };
+        if n == 0 {
+            break;
+        }
+
+        let write_res = timeout(MASK_RELAY_IDLE_TIMEOUT, writer.write_all(&buf[..n])).await;
+        match write_res {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) | Err(_) => break,
+        }
+    }
+}
+
+async fn write_proxy_header_with_timeout<W>(mask_write: &mut W, header: &[u8]) -> bool
+where
+    W: AsyncWrite + Unpin,
+{
+    match timeout(MASK_TIMEOUT, mask_write.write_all(header)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => false,
+        Err(_) => {
+            debug!("Timeout writing proxy protocol header to mask backend");
+            false
+        }
+    }
+}
+
+async fn consume_client_data_with_timeout<R>(reader: R)
+where
+    R: AsyncRead + Unpin,
+{
+    if timeout(MASK_RELAY_TIMEOUT, consume_client_data(reader)).await.is_err() {
+        debug!("Timed out while consuming client data on masking fallback path");
+    }
+}
+
+async fn wait_mask_connect_budget(started: Instant) {
+    let elapsed = started.elapsed();
+    if elapsed < MASK_TIMEOUT {
+        tokio::time::sleep(MASK_TIMEOUT - elapsed).await;
+    }
+}
+
+async fn wait_mask_outcome_budget(started: Instant) {
+    let elapsed = started.elapsed();
+    if elapsed < MASK_TIMEOUT {
+        tokio::time::sleep(MASK_TIMEOUT - elapsed).await;
+    }
+}
 
 /// Detect client type based on initial data
 fn detect_client_type(data: &[u8]) -> &'static str {
@@ -71,13 +142,15 @@ where
 
     if !config.censorship.mask {
         // Masking disabled, just consume data
-        consume_client_data(reader).await;
+        consume_client_data_with_timeout(reader).await;
         return;
     }
 
     // Connect via Unix socket or TCP
     #[cfg(unix)]
     if let Some(ref sock_path) = config.censorship.mask_unix_sock {
+        let outcome_started = Instant::now();
+        let connect_started = Instant::now();
         debug!(
             client_type = client_type,
             sock = %sock_path,
@@ -107,21 +180,26 @@ where
                     }
                 };
                 if let Some(header) = proxy_header {
-                    if mask_write.write_all(&header).await.is_err() {
+                    if !write_proxy_header_with_timeout(&mut mask_write, &header).await {
+                        wait_mask_outcome_budget(outcome_started).await;
                         return;
                     }
                 }
                 if timeout(MASK_RELAY_TIMEOUT, relay_to_mask(reader, writer, mask_read, mask_write, initial_data)).await.is_err() {
                     debug!("Mask relay timed out (unix socket)");
                 }
+                wait_mask_outcome_budget(outcome_started).await;
             }
             Ok(Err(e)) => {
+                wait_mask_connect_budget(connect_started).await;
                 debug!(error = %e, "Failed to connect to mask unix socket");
-                consume_client_data(reader).await;
+                consume_client_data_with_timeout(reader).await;
+                wait_mask_outcome_budget(outcome_started).await;
             }
             Err(_) => {
                 debug!("Timeout connecting to mask unix socket");
-                consume_client_data(reader).await;
+                consume_client_data_with_timeout(reader).await;
+                wait_mask_outcome_budget(outcome_started).await;
             }
         }
         return;
@@ -143,6 +221,8 @@ where
     let mask_addr = resolve_socket_addr(mask_host, mask_port)
         .map(|addr| addr.to_string())
         .unwrap_or_else(|| format!("{}:{}", mask_host, mask_port));
+    let outcome_started = Instant::now();
+    let connect_started = Instant::now();
     let connect_result = timeout(MASK_TIMEOUT, TcpStream::connect(&mask_addr)).await;
     match connect_result {
         Ok(Ok(stream)) => {
@@ -166,21 +246,26 @@ where
 
             let (mask_read, mut mask_write) = stream.into_split();
             if let Some(header) = proxy_header {
-                if mask_write.write_all(&header).await.is_err() {
+                if !write_proxy_header_with_timeout(&mut mask_write, &header).await {
+                    wait_mask_outcome_budget(outcome_started).await;
                     return;
                 }
             }
             if timeout(MASK_RELAY_TIMEOUT, relay_to_mask(reader, writer, mask_read, mask_write, initial_data)).await.is_err() {
                 debug!("Mask relay timed out");
             }
+            wait_mask_outcome_budget(outcome_started).await;
         }
         Ok(Err(e)) => {
+            wait_mask_connect_budget(connect_started).await;
             debug!(error = %e, "Failed to connect to mask host");
-            consume_client_data(reader).await;
+            consume_client_data_with_timeout(reader).await;
+            wait_mask_outcome_budget(outcome_started).await;
         }
         Err(_) => {
             debug!("Timeout connecting to mask host");
-            consume_client_data(reader).await;
+            consume_client_data_with_timeout(reader).await;
+            wait_mask_outcome_budget(outcome_started).await;
         }
     }
 }
@@ -203,47 +288,20 @@ where
     if mask_write.write_all(initial_data).await.is_err() {
         return;
     }
-
-    // Relay traffic
-    let c2m = tokio::spawn(async move {
-        let mut buf = vec![0u8; MASK_BUFFER_SIZE];
-        loop {
-            match reader.read(&mut buf).await {
-                Ok(0) | Err(_) => {
-                    let _ = mask_write.shutdown().await;
-                    break;
-                }
-                Ok(n) => {
-                    if mask_write.write_all(&buf[..n]).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    let m2c = tokio::spawn(async move {
-        let mut buf = vec![0u8; MASK_BUFFER_SIZE];
-        loop {
-            match mask_read.read(&mut buf).await {
-                Ok(0) | Err(_) => {
-                    let _ = writer.shutdown().await;
-                    break;
-                }
-                Ok(n) => {
-                    if writer.write_all(&buf[..n]).await.is_err() {
-                        break;
-                    }
-                }
-            }
-        }
-    });
-
-    // Wait for either to complete
-    tokio::select! {
-        _ = c2m => {}
-        _ = m2c => {}
+    if mask_write.flush().await.is_err() {
+        return;
     }
+
+    let _ = tokio::join!(
+        async {
+            copy_with_idle_timeout(&mut reader, &mut mask_write).await;
+            let _ = mask_write.shutdown().await;
+        },
+        async {
+            copy_with_idle_timeout(&mut mask_read, &mut writer).await;
+            let _ = writer.shutdown().await;
+        }
+    );
 }
 
 /// Just consume all data from client without responding
@@ -255,3 +313,11 @@ async fn consume_client_data<R: AsyncRead + Unpin>(mut reader: R) {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "masking_security_tests.rs"]
+mod security_tests;
+
+#[cfg(test)]
+#[path = "masking_adversarial_tests.rs"]
+mod adversarial_tests;

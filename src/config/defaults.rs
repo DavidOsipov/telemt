@@ -82,7 +82,9 @@ pub(crate) fn default_replay_check_len() -> usize {
 }
 
 pub(crate) fn default_replay_window_secs() -> u64 {
-    1800
+    // Keep replay cache TTL tight by default to reduce replay surface.
+    // Deployments with higher RTT or longer reconnect jitter can override this in config.
+    120
 }
 
 pub(crate) fn default_handshake_timeout() -> u64 {
@@ -481,11 +483,11 @@ pub(crate) fn default_tls_full_cert_ttl_secs() -> u64 {
 }
 
 pub(crate) fn default_server_hello_delay_min_ms() -> u64 {
-    0
+    8
 }
 
 pub(crate) fn default_server_hello_delay_max_ms() -> u64 {
-    0
+    24
 }
 
 pub(crate) fn default_alpn_enforce() -> bool {

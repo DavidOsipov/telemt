@@ -6,6 +6,7 @@ pub mod beobachten;
 pub mod telemetry;
 
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use dashmap::DashMap;
 use parking_lot::Mutex;
@@ -18,6 +19,46 @@ use tracing::debug;
 
 use crate::config::{MeTelemetryLevel, MeWriterPickMode};
 use self::telemetry::TelemetryPolicy;
+
+#[derive(Clone, Copy)]
+enum RouteConnectionGauge {
+    Direct,
+    Middle,
+}
+
+#[must_use = "RouteConnectionLease must be kept alive to hold the connection gauge increment"]
+pub struct RouteConnectionLease {
+    stats: Arc<Stats>,
+    gauge: RouteConnectionGauge,
+    active: bool,
+}
+
+impl RouteConnectionLease {
+    fn new(stats: Arc<Stats>, gauge: RouteConnectionGauge) -> Self {
+        Self {
+            stats,
+            gauge,
+            active: true,
+        }
+    }
+
+    #[cfg(test)]
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for RouteConnectionLease {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        match self.gauge {
+            RouteConnectionGauge::Direct => self.stats.decrement_current_connections_direct(),
+            RouteConnectionGauge::Middle => self.stats.decrement_current_connections_me(),
+        }
+    }
+}
 
 // ============= Stats =============
 
@@ -120,8 +161,6 @@ pub struct Stats {
     pool_swap_total: AtomicU64,
     pool_drain_active: AtomicU64,
     pool_force_close_total: AtomicU64,
-    pool_drain_soft_evict_total: AtomicU64,
-    pool_drain_soft_evict_writer_total: AtomicU64,
     pool_stale_pick_total: AtomicU64,
     me_writer_removed_total: AtomicU64,
     me_writer_removed_unexpected_total: AtomicU64,
@@ -135,11 +174,6 @@ pub struct Stats {
     me_inline_recovery_total: AtomicU64,
     ip_reservation_rollback_tcp_limit_total: AtomicU64,
     ip_reservation_rollback_quota_limit_total: AtomicU64,
-    relay_adaptive_promotions_total: AtomicU64,
-    relay_adaptive_demotions_total: AtomicU64,
-    relay_adaptive_hard_promotions_total: AtomicU64,
-    reconnect_evict_total: AtomicU64,
-    reconnect_stale_close_total: AtomicU64,
     telemetry_core_enabled: AtomicBool,
     telemetry_user_enabled: AtomicBool,
     telemetry_me_level: AtomicU8,
@@ -292,35 +326,15 @@ impl Stats {
     pub fn decrement_current_connections_me(&self) {
         Self::decrement_atomic_saturating(&self.current_connections_me);
     }
-    pub fn increment_relay_adaptive_promotions_total(&self) {
-        if self.telemetry_core_enabled() {
-            self.relay_adaptive_promotions_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
+
+    pub fn acquire_direct_connection_lease(self: &Arc<Self>) -> RouteConnectionLease {
+        self.increment_current_connections_direct();
+        RouteConnectionLease::new(self.clone(), RouteConnectionGauge::Direct)
     }
-    pub fn increment_relay_adaptive_demotions_total(&self) {
-        if self.telemetry_core_enabled() {
-            self.relay_adaptive_demotions_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    pub fn increment_relay_adaptive_hard_promotions_total(&self) {
-        if self.telemetry_core_enabled() {
-            self.relay_adaptive_hard_promotions_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    pub fn increment_reconnect_evict_total(&self) {
-        if self.telemetry_core_enabled() {
-            self.reconnect_evict_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    pub fn increment_reconnect_stale_close_total(&self) {
-        if self.telemetry_core_enabled() {
-            self.reconnect_stale_close_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
+
+    pub fn acquire_me_connection_lease(self: &Arc<Self>) -> RouteConnectionLease {
+        self.increment_current_connections_me();
+        RouteConnectionLease::new(self.clone(), RouteConnectionGauge::Middle)
     }
     pub fn increment_handshake_timeouts(&self) {
         if self.telemetry_core_enabled() {
@@ -717,18 +731,6 @@ impl Stats {
             self.pool_force_close_total.fetch_add(1, Ordering::Relaxed);
         }
     }
-    pub fn increment_pool_drain_soft_evict_total(&self) {
-        if self.telemetry_me_allows_normal() {
-            self.pool_drain_soft_evict_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
-    pub fn increment_pool_drain_soft_evict_writer_total(&self) {
-        if self.telemetry_me_allows_normal() {
-            self.pool_drain_soft_evict_writer_total
-                .fetch_add(1, Ordering::Relaxed);
-        }
-    }
     pub fn increment_pool_stale_pick_total(&self) {
         if self.telemetry_me_allows_normal() {
             self.pool_stale_pick_total.fetch_add(1, Ordering::Relaxed);
@@ -982,22 +984,6 @@ impl Stats {
         self.get_current_connections_direct()
             .saturating_add(self.get_current_connections_me())
     }
-    pub fn get_relay_adaptive_promotions_total(&self) -> u64 {
-        self.relay_adaptive_promotions_total.load(Ordering::Relaxed)
-    }
-    pub fn get_relay_adaptive_demotions_total(&self) -> u64 {
-        self.relay_adaptive_demotions_total.load(Ordering::Relaxed)
-    }
-    pub fn get_relay_adaptive_hard_promotions_total(&self) -> u64 {
-        self.relay_adaptive_hard_promotions_total
-            .load(Ordering::Relaxed)
-    }
-    pub fn get_reconnect_evict_total(&self) -> u64 {
-        self.reconnect_evict_total.load(Ordering::Relaxed)
-    }
-    pub fn get_reconnect_stale_close_total(&self) -> u64 {
-        self.reconnect_stale_close_total.load(Ordering::Relaxed)
-    }
     pub fn get_me_keepalive_sent(&self) -> u64 { self.me_keepalive_sent.load(Ordering::Relaxed) }
     pub fn get_me_keepalive_failed(&self) -> u64 { self.me_keepalive_failed.load(Ordering::Relaxed) }
     pub fn get_me_keepalive_pong(&self) -> u64 { self.me_keepalive_pong.load(Ordering::Relaxed) }
@@ -1250,12 +1236,6 @@ impl Stats {
     pub fn get_pool_force_close_total(&self) -> u64 {
         self.pool_force_close_total.load(Ordering::Relaxed)
     }
-    pub fn get_pool_drain_soft_evict_total(&self) -> u64 {
-        self.pool_drain_soft_evict_total.load(Ordering::Relaxed)
-    }
-    pub fn get_pool_drain_soft_evict_writer_total(&self) -> u64 {
-        self.pool_drain_soft_evict_writer_total.load(Ordering::Relaxed)
-    }
     pub fn get_pool_stale_pick_total(&self) -> u64 {
         self.pool_stale_pick_total.load(Ordering::Relaxed)
     }
@@ -1327,11 +1307,35 @@ impl Stats {
         Self::touch_user_stats(stats.value());
         stats.curr_connects.fetch_add(1, Ordering::Relaxed);
     }
+
+    pub fn try_acquire_user_curr_connects(&self, user: &str, limit: Option<u64>) -> bool {
+        if !self.telemetry_user_enabled() {
+            return true;
+        }
+
+        self.maybe_cleanup_user_stats();
+        let stats = self.user_stats.entry(user.to_string()).or_default();
+        Self::touch_user_stats(stats.value());
+
+        let counter = &stats.curr_connects;
+        let mut current = counter.load(Ordering::Relaxed);
+        loop {
+            if let Some(max) = limit && current >= max {
+                return false;
+            }
+            match counter.compare_exchange_weak(
+                current,
+                current.saturating_add(1),
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return true,
+                Err(actual) => current = actual,
+            }
+        }
+    }
     
     pub fn decrement_user_curr_connects(&self, user: &str) {
-        if !self.telemetry_user_enabled() {
-            return;
-        }
         self.maybe_cleanup_user_stats();
         if let Some(stats) = self.user_stats.get(user) {
             Self::touch_user_stats(stats.value());
@@ -1504,9 +1508,11 @@ impl Stats {
 // ============= Replay Checker =============
 
 pub struct ReplayChecker {
-    shards: Vec<Mutex<ReplayShard>>,
+    handshake_shards: Vec<Mutex<ReplayShard>>,
+    tls_shards: Vec<Mutex<ReplayShard>>,
     shard_mask: usize,
     window: Duration,
+    tls_window: Duration,
     checks: AtomicU64,
     hits: AtomicU64,
     additions: AtomicU64,
@@ -1583,19 +1589,24 @@ impl ReplayShard {
 
 impl ReplayChecker {
     pub fn new(total_capacity: usize, window: Duration) -> Self {
+        const MIN_TLS_REPLAY_WINDOW: Duration = Duration::from_secs(120);
         let num_shards = 64;
         let shard_capacity = (total_capacity / num_shards).max(1);
         let cap = NonZeroUsize::new(shard_capacity).unwrap();
 
-        let mut shards = Vec::with_capacity(num_shards);
+        let mut handshake_shards = Vec::with_capacity(num_shards);
+        let mut tls_shards = Vec::with_capacity(num_shards);
         for _ in 0..num_shards {
-            shards.push(Mutex::new(ReplayShard::new(cap)));
+            handshake_shards.push(Mutex::new(ReplayShard::new(cap)));
+            tls_shards.push(Mutex::new(ReplayShard::new(cap)));
         }
 
         Self {
-            shards,
+            handshake_shards,
+            tls_shards,
             shard_mask: num_shards - 1,
             window,
+            tls_window: window.max(MIN_TLS_REPLAY_WINDOW),
             checks: AtomicU64::new(0),
             hits: AtomicU64::new(0),
             additions: AtomicU64::new(0),
@@ -1609,46 +1620,60 @@ impl ReplayChecker {
         (hasher.finish() as usize) & self.shard_mask
     }
 
-    fn check_and_add_internal(&self, data: &[u8]) -> bool {
+    fn check_and_add_internal(
+        &self,
+        data: &[u8],
+        shards: &[Mutex<ReplayShard>],
+        window: Duration,
+    ) -> bool {
         self.checks.fetch_add(1, Ordering::Relaxed);
         let idx = self.get_shard_idx(data);
-        let mut shard = self.shards[idx].lock();
+        let mut shard = shards[idx].lock();
         let now = Instant::now();
-        let found = shard.check(data, now, self.window);
+        let found = shard.check(data, now, window);
         if found {
             self.hits.fetch_add(1, Ordering::Relaxed);
         } else {
-            shard.add(data, now, self.window);
+            shard.add(data, now, window);
             self.additions.fetch_add(1, Ordering::Relaxed);
         }
         found
     }
 
-    fn add_only(&self, data: &[u8]) {
+    fn add_only(&self, data: &[u8], shards: &[Mutex<ReplayShard>], window: Duration) {
         self.additions.fetch_add(1, Ordering::Relaxed);
         let idx = self.get_shard_idx(data);
-        let mut shard = self.shards[idx].lock();
-        shard.add(data, Instant::now(), self.window);
+        let mut shard = shards[idx].lock();
+        shard.add(data, Instant::now(), window);
     }
 
     pub fn check_and_add_handshake(&self, data: &[u8]) -> bool {
-        self.check_and_add_internal(data)
+        self.check_and_add_internal(data, &self.handshake_shards, self.window)
     }
 
     pub fn check_and_add_tls_digest(&self, data: &[u8]) -> bool {
-        self.check_and_add_internal(data)
+        self.check_and_add_internal(data, &self.tls_shards, self.tls_window)
     }
 
     // Compatibility helpers (non-atomic split operations) — prefer check_and_add_*.
     pub fn check_handshake(&self, data: &[u8]) -> bool { self.check_and_add_handshake(data) }
-    pub fn add_handshake(&self, data: &[u8]) { self.add_only(data) }
+    pub fn add_handshake(&self, data: &[u8]) {
+        self.add_only(data, &self.handshake_shards, self.window)
+    }
     pub fn check_tls_digest(&self, data: &[u8]) -> bool { self.check_and_add_tls_digest(data) }
-    pub fn add_tls_digest(&self, data: &[u8]) { self.add_only(data) }
+    pub fn add_tls_digest(&self, data: &[u8]) {
+        self.add_only(data, &self.tls_shards, self.tls_window)
+    }
     
     pub fn stats(&self) -> ReplayStats {
         let mut total_entries = 0;
         let mut total_queue_len = 0;
-        for shard in &self.shards {
+        for shard in &self.handshake_shards {
+            let s = shard.lock();
+            total_entries += s.cache.len();
+            total_queue_len += s.queue.len();
+        }
+        for shard in &self.tls_shards {
             let s = shard.lock();
             total_entries += s.cache.len();
             total_queue_len += s.queue.len();
@@ -1661,7 +1686,7 @@ impl ReplayChecker {
             total_hits: self.hits.load(Ordering::Relaxed),
             total_additions: self.additions.load(Ordering::Relaxed),
             total_cleanups: self.cleanups.load(Ordering::Relaxed),
-            num_shards: self.shards.len(),
+            num_shards: self.handshake_shards.len() + self.tls_shards.len(),
             window_secs: self.window.as_secs(),
         }
     }
@@ -1679,10 +1704,17 @@ impl ReplayChecker {
             let now = Instant::now();
             let mut cleaned = 0usize;
             
-            for shard_mutex in &self.shards {
+            for shard_mutex in &self.handshake_shards {
                 let mut shard = shard_mutex.lock();
                 let before = shard.len();
                 shard.cleanup(now, self.window);
+                let after = shard.len();
+                cleaned += before.saturating_sub(after);
+            }
+            for shard_mutex in &self.tls_shards {
+                let mut shard = shard_mutex.lock();
+                let before = shard.len();
+                shard.cleanup(now, self.tls_window);
                 let after = shard.len();
                 cleaned += before.saturating_sub(after);
             }
@@ -1811,7 +1843,7 @@ mod tests {
     fn test_replay_checker_many_keys() {
         let checker = ReplayChecker::new(10_000, Duration::from_secs(60));
         for i in 0..500u32 {
-            checker.add_only(&i.to_le_bytes());
+            checker.add_handshake(&i.to_le_bytes());
         }
         for i in 0..500u32 {
             assert!(checker.check_handshake(&i.to_le_bytes()));
@@ -1819,3 +1851,11 @@ mod tests {
         assert_eq!(checker.stats().total_entries, 500);
     }
 }
+
+#[cfg(test)]
+#[path = "connection_lease_security_tests.rs"]
+mod connection_lease_security_tests;
+
+#[cfg(test)]
+#[path = "replay_checker_security_tests.rs"]
+mod replay_checker_security_tests;

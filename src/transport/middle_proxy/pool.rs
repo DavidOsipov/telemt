@@ -160,6 +160,7 @@ pub struct MePool {
     pub(super) refill_inflight: Arc<Mutex<HashSet<RefillEndpointKey>>>,
     pub(super) refill_inflight_dc: Arc<Mutex<HashSet<RefillDcKey>>>,
     pub(super) conn_count: AtomicUsize,
+    pub(super) draining_active_runtime: AtomicU64,
     pub(super) stats: Arc<crate::stats::Stats>,
     pub(super) generation: AtomicU64,
     pub(super) active_generation: AtomicU64,
@@ -172,11 +173,6 @@ pub struct MePool {
     pub(super) kdf_material_fingerprint: Arc<RwLock<HashMap<SocketAddr, (u64, u16)>>>,
     pub(super) me_pool_drain_ttl_secs: AtomicU64,
     pub(super) me_pool_drain_threshold: AtomicU64,
-    pub(super) me_pool_drain_soft_evict_enabled: AtomicBool,
-    pub(super) me_pool_drain_soft_evict_grace_secs: AtomicU64,
-    pub(super) me_pool_drain_soft_evict_per_writer: AtomicU8,
-    pub(super) me_pool_drain_soft_evict_budget_per_core: AtomicU32,
-    pub(super) me_pool_drain_soft_evict_cooldown_ms: AtomicU64,
     pub(super) me_pool_force_close_secs: AtomicU64,
     pub(super) me_pool_min_fresh_ratio_permille: AtomicU32,
     pub(super) me_hardswap_warmup_delay_min_ms: AtomicU64,
@@ -193,8 +189,6 @@ pub struct MePool {
     pub(super) me_reader_route_data_wait_ms: Arc<AtomicU64>,
     pub(super) me_route_no_writer_mode: AtomicU8,
     pub(super) me_route_no_writer_wait: Duration,
-    pub(super) me_route_hybrid_max_wait: Duration,
-    pub(super) me_route_blocking_send_timeout: Duration,
     pub(super) me_route_inline_recovery_attempts: u32,
     pub(super) me_route_inline_recovery_wait: Duration,
     pub(super) me_health_interval_ms_unhealthy: AtomicU64,
@@ -280,11 +274,6 @@ impl MePool {
         hardswap: bool,
         me_pool_drain_ttl_secs: u64,
         me_pool_drain_threshold: u64,
-        me_pool_drain_soft_evict_enabled: bool,
-        me_pool_drain_soft_evict_grace_secs: u64,
-        me_pool_drain_soft_evict_per_writer: u8,
-        me_pool_drain_soft_evict_budget_per_core: u16,
-        me_pool_drain_soft_evict_cooldown_ms: u64,
         me_pool_force_close_secs: u64,
         me_pool_min_fresh_ratio: f32,
         me_hardswap_warmup_delay_min_ms: u64,
@@ -309,8 +298,6 @@ impl MePool {
         me_warn_rate_limit_ms: u64,
         me_route_no_writer_mode: MeRouteNoWriterMode,
         me_route_no_writer_wait_ms: u64,
-        me_route_hybrid_max_wait_ms: u64,
-        me_route_blocking_send_timeout_ms: u64,
         me_route_inline_recovery_attempts: u32,
         me_route_inline_recovery_wait_ms: u64,
     ) -> Arc<Self> {
@@ -452,6 +439,7 @@ impl MePool {
             refill_inflight: Arc::new(Mutex::new(HashSet::new())),
             refill_inflight_dc: Arc::new(Mutex::new(HashSet::new())),
             conn_count: AtomicUsize::new(0),
+            draining_active_runtime: AtomicU64::new(0),
             generation: AtomicU64::new(1),
             active_generation: AtomicU64::new(1),
             warm_generation: AtomicU64::new(0),
@@ -463,17 +451,6 @@ impl MePool {
             kdf_material_fingerprint: Arc::new(RwLock::new(HashMap::new())),
             me_pool_drain_ttl_secs: AtomicU64::new(me_pool_drain_ttl_secs),
             me_pool_drain_threshold: AtomicU64::new(me_pool_drain_threshold),
-            me_pool_drain_soft_evict_enabled: AtomicBool::new(me_pool_drain_soft_evict_enabled),
-            me_pool_drain_soft_evict_grace_secs: AtomicU64::new(me_pool_drain_soft_evict_grace_secs),
-            me_pool_drain_soft_evict_per_writer: AtomicU8::new(
-                me_pool_drain_soft_evict_per_writer.max(1),
-            ),
-            me_pool_drain_soft_evict_budget_per_core: AtomicU32::new(
-                me_pool_drain_soft_evict_budget_per_core.max(1) as u32,
-            ),
-            me_pool_drain_soft_evict_cooldown_ms: AtomicU64::new(
-                me_pool_drain_soft_evict_cooldown_ms.max(1),
-            ),
             me_pool_force_close_secs: AtomicU64::new(me_pool_force_close_secs),
             me_pool_min_fresh_ratio_permille: AtomicU32::new(Self::ratio_to_permille(
                 me_pool_min_fresh_ratio,
@@ -494,10 +471,6 @@ impl MePool {
             me_reader_route_data_wait_ms: Arc::new(AtomicU64::new(me_reader_route_data_wait_ms)),
             me_route_no_writer_mode: AtomicU8::new(me_route_no_writer_mode.as_u8()),
             me_route_no_writer_wait: Duration::from_millis(me_route_no_writer_wait_ms),
-            me_route_hybrid_max_wait: Duration::from_millis(me_route_hybrid_max_wait_ms),
-            me_route_blocking_send_timeout: Duration::from_millis(
-                me_route_blocking_send_timeout_ms,
-            ),
             me_route_inline_recovery_attempts,
             me_route_inline_recovery_wait: Duration::from_millis(me_route_inline_recovery_wait_ms),
             me_health_interval_ms_unhealthy: AtomicU64::new(me_health_interval_ms_unhealthy.max(1)),
@@ -525,11 +498,6 @@ impl MePool {
         hardswap: bool,
         drain_ttl_secs: u64,
         pool_drain_threshold: u64,
-        pool_drain_soft_evict_enabled: bool,
-        pool_drain_soft_evict_grace_secs: u64,
-        pool_drain_soft_evict_per_writer: u8,
-        pool_drain_soft_evict_budget_per_core: u16,
-        pool_drain_soft_evict_cooldown_ms: u64,
         force_close_secs: u64,
         min_fresh_ratio: f32,
         hardswap_warmup_delay_min_ms: u64,
@@ -570,18 +538,6 @@ impl MePool {
             .store(drain_ttl_secs, Ordering::Relaxed);
         self.me_pool_drain_threshold
             .store(pool_drain_threshold, Ordering::Relaxed);
-        self.me_pool_drain_soft_evict_enabled
-            .store(pool_drain_soft_evict_enabled, Ordering::Relaxed);
-        self.me_pool_drain_soft_evict_grace_secs
-            .store(pool_drain_soft_evict_grace_secs, Ordering::Relaxed);
-        self.me_pool_drain_soft_evict_per_writer
-            .store(pool_drain_soft_evict_per_writer.max(1), Ordering::Relaxed);
-        self.me_pool_drain_soft_evict_budget_per_core.store(
-            pool_drain_soft_evict_budget_per_core.max(1) as u32,
-            Ordering::Relaxed,
-        );
-        self.me_pool_drain_soft_evict_cooldown_ms
-            .store(pool_drain_soft_evict_cooldown_ms.max(1), Ordering::Relaxed);
         self.me_pool_force_close_secs
             .store(force_close_secs, Ordering::Relaxed);
         self.me_pool_min_fresh_ratio_permille
@@ -736,34 +692,31 @@ impl MePool {
         }
     }
 
-    pub(super) fn drain_soft_evict_enabled(&self) -> bool {
-        self.me_pool_drain_soft_evict_enabled
-            .load(Ordering::Relaxed)
+    #[allow(dead_code)]
+    pub(super) fn draining_active_runtime(&self) -> u64 {
+        self.draining_active_runtime.load(Ordering::Relaxed)
     }
 
-    pub(super) fn drain_soft_evict_grace_secs(&self) -> u64 {
-        self.me_pool_drain_soft_evict_grace_secs
-            .load(Ordering::Relaxed)
+    pub(super) fn increment_draining_active_runtime(&self) {
+        self.draining_active_runtime.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(super) fn drain_soft_evict_per_writer(&self) -> usize {
-        self.me_pool_drain_soft_evict_per_writer
-            .load(Ordering::Relaxed)
-            .max(1) as usize
-    }
-
-    pub(super) fn drain_soft_evict_budget_per_core(&self) -> usize {
-        self.me_pool_drain_soft_evict_budget_per_core
-            .load(Ordering::Relaxed)
-            .max(1) as usize
-    }
-
-    pub(super) fn drain_soft_evict_cooldown(&self) -> Duration {
-        Duration::from_millis(
-            self.me_pool_drain_soft_evict_cooldown_ms
-                .load(Ordering::Relaxed)
-                .max(1),
-        )
+    pub(super) fn decrement_draining_active_runtime(&self) {
+        let mut current = self.draining_active_runtime.load(Ordering::Relaxed);
+        loop {
+            if current == 0 {
+                break;
+            }
+            match self.draining_active_runtime.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(actual) => current = actual,
+            }
+        }
     }
 
     pub(super) async fn key_selector(&self) -> u32 {

@@ -1,14 +1,15 @@
-use std::collections::HashMap;
-use std::collections::hash_map::DefaultHasher;
+use std::collections::hash_map::RandomState;
+use std::hash::BuildHasher;
 use std::hash::{Hash, Hasher};
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use bytes::Bytes;
+use dashmap::DashMap;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot, watch, Mutex as AsyncMutex};
+use tokio::time::timeout;
 use tracing::{debug, trace, warn};
 
 use crate::config::ProxyConfig;
@@ -20,25 +21,38 @@ use crate::proxy::route_mode::{
     RelayRouteMode, RouteCutoverState, ROUTE_SWITCH_ERROR_MSG, affected_cutover_state,
     cutover_stagger_delay,
 };
-use crate::proxy::adaptive_buffers::{self, AdaptiveTier};
-use crate::proxy::session_eviction::SessionLease;
 use crate::stats::Stats;
-use crate::stream::{BufferPool, CryptoReader, CryptoWriter};
+use crate::stream::{BufferPool, CryptoReader, CryptoWriter, PooledBuffer};
 use crate::transport::middle_proxy::{MePool, MeResponse, proto_flags_for_tag};
 
 enum C2MeCommand {
-    Data { payload: Bytes, flags: u32 },
+    Data { payload: PooledBuffer, flags: u32 },
     Close,
 }
 
 const DESYNC_DEDUP_WINDOW: Duration = Duration::from_secs(60);
+const DESYNC_DEDUP_MAX_ENTRIES: usize = 65_536;
+const DESYNC_DEDUP_PRUNE_SCAN_LIMIT: usize = 1024;
+const DESYNC_FULL_CACHE_EMIT_MIN_INTERVAL: Duration = Duration::from_millis(1000);
 const DESYNC_ERROR_CLASS: &str = "frame_too_large_crypto_desync";
 const C2ME_CHANNEL_CAPACITY_FALLBACK: usize = 128;
 const C2ME_SOFT_PRESSURE_MIN_FREE_SLOTS: usize = 64;
 const C2ME_SENDER_FAIRNESS_BUDGET: usize = 32;
+#[cfg(test)]
+const C2ME_SEND_TIMEOUT: Duration = Duration::from_millis(50);
+#[cfg(not(test))]
+const C2ME_SEND_TIMEOUT: Duration = Duration::from_secs(5);
 const ME_D2C_FLUSH_BATCH_MAX_FRAMES_MIN: usize = 1;
 const ME_D2C_FLUSH_BATCH_MAX_BYTES_MIN: usize = 4096;
-static DESYNC_DEDUP: OnceLock<Mutex<HashMap<u64, Instant>>> = OnceLock::new();
+#[cfg(test)]
+const QUOTA_USER_LOCKS_MAX: usize = 64;
+#[cfg(not(test))]
+const QUOTA_USER_LOCKS_MAX: usize = 4_096;
+static DESYNC_DEDUP: OnceLock<DashMap<u64, Instant>> = OnceLock::new();
+static DESYNC_HASHER: OnceLock<RandomState> = OnceLock::new();
+static DESYNC_FULL_CACHE_LAST_EMIT_AT: OnceLock<Mutex<Option<Instant>>> = OnceLock::new();
+static DESYNC_DEDUP_EVER_SATURATED: OnceLock<AtomicBool> = OnceLock::new();
+static QUOTA_USER_LOCKS: OnceLock<DashMap<String, Arc<AsyncMutex<()>>>> = OnceLock::new();
 
 struct RelayForensicsState {
     trace_id: u64,
@@ -61,8 +75,8 @@ struct MeD2cFlushPolicy {
 }
 
 impl MeD2cFlushPolicy {
-    fn from_config(config: &ProxyConfig, tier: AdaptiveTier) -> Self {
-        let base = Self {
+    fn from_config(config: &ProxyConfig) -> Self {
+        Self {
             max_frames: config
                 .general
                 .me_d2c_flush_batch_max_frames
@@ -73,24 +87,13 @@ impl MeD2cFlushPolicy {
                 .max(ME_D2C_FLUSH_BATCH_MAX_BYTES_MIN),
             max_delay: Duration::from_micros(config.general.me_d2c_flush_batch_max_delay_us),
             ack_flush_immediate: config.general.me_d2c_ack_flush_immediate,
-        };
-        let (max_frames, max_bytes, max_delay) = adaptive_buffers::me_flush_policy_for_tier(
-            tier,
-            base.max_frames,
-            base.max_bytes,
-            base.max_delay,
-        );
-        Self {
-            max_frames,
-            max_bytes,
-            max_delay,
-            ack_flush_immediate: base.ack_flush_immediate,
         }
     }
 }
 
 fn hash_value<T: Hash>(value: &T) -> u64 {
-    let mut hasher = DefaultHasher::new();
+    let state = DESYNC_HASHER.get_or_init(RandomState::new);
+    let mut hasher = state.build_hasher();
     value.hash(&mut hasher);
     hasher.finish()
 }
@@ -104,24 +107,120 @@ fn should_emit_full_desync(key: u64, all_full: bool, now: Instant) -> bool {
         return true;
     }
 
-    let dedup = DESYNC_DEDUP.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = dedup.lock().expect("desync dedup mutex poisoned");
-    guard.retain(|_, seen_at| now.duration_since(*seen_at) < DESYNC_DEDUP_WINDOW);
+    let dedup = DESYNC_DEDUP.get_or_init(DashMap::new);
+    let saturated_before = dedup.len() >= DESYNC_DEDUP_MAX_ENTRIES;
+    let ever_saturated = DESYNC_DEDUP_EVER_SATURATED.get_or_init(|| AtomicBool::new(false));
+    if saturated_before {
+        ever_saturated.store(true, Ordering::Relaxed);
+    }
 
-    match guard.get_mut(&key) {
-        Some(seen_at) => {
-            if now.duration_since(*seen_at) >= DESYNC_DEDUP_WINDOW {
-                *seen_at = now;
+    if let Some(mut seen_at) = dedup.get_mut(&key) {
+        if now.duration_since(*seen_at) >= DESYNC_DEDUP_WINDOW {
+            *seen_at = now;
+            return true;
+        }
+        return false;
+    }
+
+    if dedup.len() >= DESYNC_DEDUP_MAX_ENTRIES {
+        let mut stale_keys = Vec::new();
+        let mut oldest_candidate: Option<(u64, Instant)> = None;
+        for entry in dedup.iter().take(DESYNC_DEDUP_PRUNE_SCAN_LIMIT) {
+            let key = *entry.key();
+            let seen_at = *entry.value();
+
+            match oldest_candidate {
+                Some((_, oldest_seen)) if seen_at >= oldest_seen => {}
+                _ => oldest_candidate = Some((key, seen_at)),
+            }
+
+            if now.duration_since(seen_at) >= DESYNC_DEDUP_WINDOW {
+                stale_keys.push(*entry.key());
+            }
+        }
+        for stale_key in stale_keys {
+            dedup.remove(&stale_key);
+        }
+        if dedup.len() >= DESYNC_DEDUP_MAX_ENTRIES {
+            let Some((evict_key, _)) = oldest_candidate else {
+                return false;
+            };
+            dedup.remove(&evict_key);
+            dedup.insert(key, now);
+            return should_emit_full_desync_full_cache(now);
+        }
+    }
+
+    dedup.insert(key, now);
+    let saturated_after = dedup.len() >= DESYNC_DEDUP_MAX_ENTRIES;
+    // Preserve the first sequential insert that reaches capacity as a normal
+    // emit, while still gating concurrent newcomer churn after the cache has
+    // ever been observed at saturation.
+    let was_ever_saturated = if saturated_after {
+        ever_saturated.swap(true, Ordering::Relaxed)
+    } else {
+        ever_saturated.load(Ordering::Relaxed)
+    };
+
+    if saturated_before || (saturated_after && was_ever_saturated) {
+        should_emit_full_desync_full_cache(now)
+    } else {
+        true
+    }
+}
+
+fn should_emit_full_desync_full_cache(now: Instant) -> bool {
+    let gate = DESYNC_FULL_CACHE_LAST_EMIT_AT.get_or_init(|| Mutex::new(None));
+    let Ok(mut last_emit_at) = gate.lock() else {
+        return false;
+    };
+
+    match *last_emit_at {
+        None => {
+            *last_emit_at = Some(now);
+            true
+        }
+        Some(last) => {
+            let Some(elapsed) = now.checked_duration_since(last) else {
+                *last_emit_at = Some(now);
+                return true;
+            };
+            if elapsed >= DESYNC_FULL_CACHE_EMIT_MIN_INTERVAL {
+                *last_emit_at = Some(now);
                 true
             } else {
                 false
             }
         }
-        None => {
-            guard.insert(key, now);
-            true
+    }
+}
+
+#[cfg(test)]
+fn clear_desync_dedup_for_testing() {
+    if let Some(dedup) = DESYNC_DEDUP.get() {
+        dedup.clear();
+    }
+    if let Some(ever_saturated) = DESYNC_DEDUP_EVER_SATURATED.get() {
+        ever_saturated.store(false, Ordering::Relaxed);
+    }
+    if let Some(last_emit_at) = DESYNC_FULL_CACHE_LAST_EMIT_AT.get() {
+        match last_emit_at.lock() {
+            Ok(mut guard) => {
+                *guard = None;
+            }
+            Err(poisoned) => {
+                let mut guard = poisoned.into_inner();
+                *guard = None;
+                last_emit_at.clear_poison();
+            }
         }
     }
+}
+
+#[cfg(test)]
+fn desync_dedup_test_lock() -> &'static Mutex<()> {
+    static TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    TEST_LOCK.get_or_init(|| Mutex::new(()))
 }
 
 fn report_desync_frame_too_large(
@@ -219,10 +318,49 @@ fn should_yield_c2me_sender(sent_since_yield: usize, has_backlog: bool) -> bool 
     has_backlog && sent_since_yield >= C2ME_SENDER_FAIRNESS_BUDGET
 }
 
+fn quota_exceeded_for_user(stats: &Stats, user: &str, quota_limit: Option<u64>) -> bool {
+    quota_limit.is_some_and(|quota| stats.get_user_total_octets(user) >= quota)
+}
+
+fn quota_would_be_exceeded_for_user(
+    stats: &Stats,
+    user: &str,
+    quota_limit: Option<u64>,
+    bytes: u64,
+) -> bool {
+    quota_limit.is_some_and(|quota| {
+        let used = stats.get_user_total_octets(user);
+        used >= quota || bytes > quota.saturating_sub(used)
+    })
+}
+
+fn quota_user_lock(user: &str) -> Arc<AsyncMutex<()>> {
+    let locks = QUOTA_USER_LOCKS.get_or_init(DashMap::new);
+    if let Some(existing) = locks.get(user) {
+        return Arc::clone(existing.value());
+    }
+
+    if locks.len() >= QUOTA_USER_LOCKS_MAX {
+        locks.retain(|_, value| Arc::strong_count(value) > 1);
+    }
+
+    if locks.len() >= QUOTA_USER_LOCKS_MAX {
+        return Arc::new(AsyncMutex::new(()));
+    }
+
+    let created = Arc::new(AsyncMutex::new(()));
+    match locks.entry(user.to_string()) {
+        dashmap::mapref::entry::Entry::Occupied(entry) => Arc::clone(entry.get()),
+        dashmap::mapref::entry::Entry::Vacant(entry) => {
+            entry.insert(Arc::clone(&created));
+            created
+        }
+    }
+}
+
 async fn enqueue_c2me_command(
     tx: &mpsc::Sender<C2MeCommand>,
     cmd: C2MeCommand,
-    send_timeout: Duration,
 ) -> std::result::Result<(), mpsc::error::SendError<C2MeCommand>> {
     match tx.try_send(cmd) {
         Ok(()) => Ok(()),
@@ -232,10 +370,7 @@ async fn enqueue_c2me_command(
             if tx.capacity() <= C2ME_SOFT_PRESSURE_MIN_FREE_SLOTS {
                 tokio::task::yield_now().await;
             }
-            if send_timeout.is_zero() {
-                return tx.send(cmd).await;
-            }
-            match tokio::time::timeout(send_timeout, tx.reserve()).await {
+            match timeout(C2ME_SEND_TIMEOUT, tx.reserve()).await {
                 Ok(Ok(permit)) => {
                     permit.send(cmd);
                     Ok(())
@@ -254,23 +389,22 @@ pub(crate) async fn handle_via_middle_proxy<R, W>(
     me_pool: Arc<MePool>,
     stats: Arc<Stats>,
     config: Arc<ProxyConfig>,
-    _buffer_pool: Arc<BufferPool>,
+    buffer_pool: Arc<BufferPool>,
     local_addr: SocketAddr,
     rng: Arc<SecureRandom>,
     mut route_rx: watch::Receiver<RouteCutoverState>,
     route_snapshot: RouteCutoverState,
     session_id: u64,
-    session_lease: SessionLease,
 ) -> Result<()>
 where
     R: AsyncRead + Unpin + Send + 'static,
     W: AsyncWrite + Unpin + Send + 'static,
 {
     let user = success.user.clone();
+    let quota_limit = config.access.user_data_quota.get(&user).copied();
     let peer = success.peer;
     let proto_tag = success.proto_tag;
     let pool_generation = me_pool.current_generation();
-    let seed_tier = adaptive_buffers::seed_tier_for_user(&user);
 
     debug!(
         user = %user,
@@ -283,7 +417,7 @@ where
     );
 
     let (conn_id, me_rx) = me_pool.registry().register().await;
-    let trace_id = conn_id;
+    let trace_id = session_id;
     let bytes_me2c = Arc::new(AtomicU64::new(0));
     let mut forensics = RelayForensicsState {
         trace_id,
@@ -298,8 +432,7 @@ where
     };
 
     stats.increment_user_connects(&user);
-    stats.increment_user_curr_connects(&user);
-    stats.increment_current_connections_me();
+    let _me_connection_lease = stats.acquire_me_connection_lease();
 
     if let Some(cutover) = affected_cutover_state(
         &route_rx,
@@ -317,18 +450,7 @@ where
         tokio::time::sleep(delay).await;
         let _ = me_pool.send_close(conn_id).await;
         me_pool.registry().unregister(conn_id).await;
-        stats.decrement_current_connections_me();
-        stats.decrement_user_curr_connects(&user);
         return Err(ProxyError::Proxy(ROUTE_SWITCH_ERROR_MSG.to_string()));
-    }
-
-    if session_lease.is_stale() {
-        stats.increment_reconnect_stale_close_total();
-        let _ = me_pool.send_close(conn_id).await;
-        me_pool.registry().unregister(conn_id).await;
-        stats.decrement_current_connections_me();
-        stats.decrement_user_curr_connects(&user);
-        return Err(ProxyError::Proxy("Session evicted by reconnect".to_string()));
     }
 
     // Per-user ad_tag from access.user_ad_tags; fallback to general.ad_tag (hot-reloadable)
@@ -366,7 +488,6 @@ where
         .general
         .me_c2me_channel_capacity
         .max(C2ME_CHANNEL_CAPACITY_FALLBACK);
-    let c2me_send_timeout = Duration::from_millis(config.general.me_c2me_send_timeout_ms);
     let (c2me_tx, mut c2me_rx) = mpsc::channel::<C2MeCommand>(c2me_channel_capacity);
     let me_pool_c2me = me_pool.clone();
     let effective_tag = effective_tag;
@@ -375,42 +496,15 @@ where
         while let Some(cmd) = c2me_rx.recv().await {
             match cmd {
                 C2MeCommand::Data { payload, flags } => {
-                    if c2me_send_timeout.is_zero() {
-                        me_pool_c2me
-                            .send_proxy_req(
-                                conn_id,
-                                success.dc_idx,
-                                peer,
-                                translated_local_addr,
-                                payload.as_ref(),
-                                flags,
-                                effective_tag.as_deref(),
-                            )
-                            .await?;
-                    } else {
-                        match tokio::time::timeout(
-                            c2me_send_timeout,
-                            me_pool_c2me.send_proxy_req(
-                                conn_id,
-                                success.dc_idx,
-                                peer,
-                                translated_local_addr,
-                                payload.as_ref(),
-                                flags,
-                                effective_tag.as_deref(),
-                            ),
-                        )
-                        .await
-                        {
-                            Ok(send_result) => send_result?,
-                            Err(_) => {
-                                return Err(ProxyError::Proxy(format!(
-                                    "ME send timeout after {}ms",
-                                    c2me_send_timeout.as_millis()
-                                )));
-                            }
-                        }
-                    }
+                    me_pool_c2me.send_proxy_req(
+                        conn_id,
+                        success.dc_idx,
+                        peer,
+                        translated_local_addr,
+                        payload.as_ref(),
+                        flags,
+                        effective_tag.as_deref(),
+                    ).await?;
                     sent_since_yield = sent_since_yield.saturating_add(1);
                     if should_yield_c2me_sender(sent_since_yield, !c2me_rx.is_empty()) {
                         sent_since_yield = 0;
@@ -432,7 +526,7 @@ where
     let rng_clone = rng.clone();
     let user_clone = user.clone();
     let bytes_me2c_clone = bytes_me2c.clone();
-    let d2c_flush_policy = MeD2cFlushPolicy::from_config(&config, seed_tier);
+    let d2c_flush_policy = MeD2cFlushPolicy::from_config(&config);
     let me_writer = tokio::spawn(async move {
         let mut writer = crypto_writer;
         let mut frame_buf = Vec::with_capacity(16 * 1024);
@@ -456,6 +550,7 @@ where
                         &mut frame_buf,
                         stats_clone.as_ref(),
                         &user_clone,
+                        quota_limit,
                         bytes_me2c_clone.as_ref(),
                         conn_id,
                         d2c_flush_policy.ack_flush_immediate,
@@ -488,6 +583,7 @@ where
                             &mut frame_buf,
                             stats_clone.as_ref(),
                             &user_clone,
+                            quota_limit,
                             bytes_me2c_clone.as_ref(),
                             conn_id,
                             d2c_flush_policy.ack_flush_immediate,
@@ -520,6 +616,7 @@ where
                                     &mut frame_buf,
                                     stats_clone.as_ref(),
                                     &user_clone,
+                                    quota_limit,
                                     bytes_me2c_clone.as_ref(),
                                     conn_id,
                                     d2c_flush_policy.ack_flush_immediate,
@@ -552,6 +649,7 @@ where
                                         &mut frame_buf,
                                         stats_clone.as_ref(),
                                         &user_clone,
+                                        quota_limit,
                                         bytes_me2c_clone.as_ref(),
                                         conn_id,
                                         d2c_flush_policy.ack_flush_immediate,
@@ -592,12 +690,6 @@ where
     let mut frame_counter: u64 = 0;
     let mut route_watch_open = true;
     loop {
-        if session_lease.is_stale() {
-            stats.increment_reconnect_stale_close_total();
-            let _ = enqueue_c2me_command(&c2me_tx, C2MeCommand::Close, c2me_send_timeout).await;
-            main_result = Err(ProxyError::Proxy("Session evicted by reconnect".to_string()));
-            break;
-        }
         if let Some(cutover) = affected_cutover_state(
             &route_rx,
             RelayRouteMode::Middle,
@@ -612,7 +704,7 @@ where
                 "Cutover affected middle session, closing client connection"
             );
             tokio::time::sleep(delay).await;
-            let _ = enqueue_c2me_command(&c2me_tx, C2MeCommand::Close, c2me_send_timeout).await;
+            let _ = enqueue_c2me_command(&c2me_tx, C2MeCommand::Close).await;
             main_result = Err(ProxyError::Proxy(ROUTE_SWITCH_ERROR_MSG.to_string()));
             break;
         }
@@ -627,6 +719,8 @@ where
                 &mut crypto_reader,
                 proto_tag,
                 frame_limit,
+                Duration::from_secs(config.timeouts.client_handshake.max(1)),
+                &buffer_pool,
                 &forensics,
                 &mut frame_counter,
                 &stats,
@@ -637,7 +731,19 @@ where
                         forensics.bytes_c2me = forensics
                             .bytes_c2me
                             .saturating_add(payload.len() as u64);
-                        stats.add_user_octets_from(&user, payload.len() as u64);
+                        if let Some(limit) = quota_limit {
+                            let quota_lock = quota_user_lock(&user);
+                            let _quota_guard = quota_lock.lock().await;
+                            stats.add_user_octets_from(&user, payload.len() as u64);
+                            if quota_exceeded_for_user(stats.as_ref(), &user, Some(limit)) {
+                                main_result = Err(ProxyError::DataQuotaExceeded {
+                                    user: user.clone(),
+                                });
+                                break;
+                            }
+                        } else {
+                            stats.add_user_octets_from(&user, payload.len() as u64);
+                        }
                         let mut flags = proto_flags;
                         if quickack {
                             flags |= RPC_FLAG_QUICKACK;
@@ -646,13 +752,9 @@ where
                             flags |= RPC_FLAG_NOT_ENCRYPTED;
                         }
                         // Keep client read loop lightweight: route heavy ME send path via a dedicated task.
-                        if enqueue_c2me_command(
-                            &c2me_tx,
-                            C2MeCommand::Data { payload, flags },
-                            c2me_send_timeout,
-                        )
-                        .await
-                        .is_err()
+                        if enqueue_c2me_command(&c2me_tx, C2MeCommand::Data { payload, flags })
+                            .await
+                            .is_err()
                         {
                             main_result = Err(ProxyError::Proxy("ME sender channel closed".into()));
                             break;
@@ -661,12 +763,7 @@ where
                     Ok(None) => {
                         debug!(conn_id, "Client EOF");
                         client_closed = true;
-                        let _ = enqueue_c2me_command(
-                            &c2me_tx,
-                            C2MeCommand::Close,
-                            c2me_send_timeout,
-                        )
-                        .await;
+                        let _ = enqueue_c2me_command(&c2me_tx, C2MeCommand::Close).await;
                         break;
                     }
                     Err(e) => {
@@ -715,10 +812,7 @@ where
         frames_ok = frame_counter,
         "ME relay cleanup"
     );
-    adaptive_buffers::record_user_tier(&user, seed_tier);
     me_pool.registry().unregister(conn_id).await;
-    stats.decrement_current_connections_me();
-    stats.decrement_user_curr_connects(&user);
     result
 }
 
@@ -726,30 +820,49 @@ async fn read_client_payload<R>(
     client_reader: &mut CryptoReader<R>,
     proto_tag: ProtoTag,
     max_frame: usize,
+    frame_read_timeout: Duration,
+    buffer_pool: &Arc<BufferPool>,
     forensics: &RelayForensicsState,
     frame_counter: &mut u64,
     stats: &Stats,
-) -> Result<Option<(Bytes, bool)>>
+) -> Result<Option<(PooledBuffer, bool)>>
 where
     R: AsyncRead + Unpin + Send + 'static,
 {
+    async fn read_exact_with_timeout<R>(
+        client_reader: &mut CryptoReader<R>,
+        buf: &mut [u8],
+        frame_read_timeout: Duration,
+    ) -> Result<()>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+    {
+        match timeout(frame_read_timeout, client_reader.read_exact(buf)).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(ProxyError::Io(e)),
+            Err(_) => Err(ProxyError::Io(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "middle-relay client frame read timeout",
+            ))),
+        }
+    }
+
     loop {
         let (len, quickack, raw_len_bytes) = match proto_tag {
             ProtoTag::Abridged => {
                 let mut first = [0u8; 1];
-                match client_reader.read_exact(&mut first).await {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-                    Err(e) => return Err(ProxyError::Io(e)),
+                match read_exact_with_timeout(client_reader, &mut first, frame_read_timeout).await {
+                    Ok(()) => {}
+                    Err(ProxyError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(e),
                 }
 
                 let quickack = (first[0] & 0x80) != 0;
                 let len_words = if (first[0] & 0x7f) == 0x7f {
                     let mut ext = [0u8; 3];
-                    client_reader
-                        .read_exact(&mut ext)
-                        .await
-                        .map_err(ProxyError::Io)?;
+                    read_exact_with_timeout(client_reader, &mut ext, frame_read_timeout).await?;
                     u32::from_le_bytes([ext[0], ext[1], ext[2], 0]) as usize
                 } else {
                     (first[0] & 0x7f) as usize
@@ -762,10 +875,12 @@ where
             }
             ProtoTag::Intermediate | ProtoTag::Secure => {
                 let mut len_buf = [0u8; 4];
-                match client_reader.read_exact(&mut len_buf).await {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
-                    Err(e) => return Err(ProxyError::Io(e)),
+                match read_exact_with_timeout(client_reader, &mut len_buf, frame_read_timeout).await {
+                    Ok(()) => {}
+                    Err(ProxyError::Io(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+                        return Ok(None);
+                    }
+                    Err(e) => return Err(e),
                 }
                 let quickack = (len_buf[3] & 0x80) != 0;
                 (
@@ -817,18 +932,21 @@ where
             len
         };
 
-        let mut payload = vec![0u8; len];
-        client_reader
-            .read_exact(&mut payload)
-            .await
-            .map_err(ProxyError::Io)?;
+        let mut payload = buffer_pool.get();
+        payload.clear();
+        let current_cap = payload.capacity();
+        if current_cap < len {
+            payload.reserve(len - current_cap);
+        }
+        payload.resize(len, 0);
+        read_exact_with_timeout(client_reader, &mut payload[..len], frame_read_timeout).await?;
 
         // Secure Intermediate: strip validated trailing padding bytes.
         if proto_tag == ProtoTag::Secure {
             payload.truncate(secure_payload_len);
         }
         *frame_counter += 1;
-        return Ok(Some((Bytes::from(payload), quickack)));
+        return Ok(Some((payload, quickack)));
     }
 }
 
@@ -849,6 +967,7 @@ async fn process_me_writer_response<W>(
     frame_buf: &mut Vec<u8>,
     stats: &Stats,
     user: &str,
+    quota_limit: Option<u64>,
     bytes_me2c: &AtomicU64,
     conn_id: u64,
     ack_flush_immediate: bool,
@@ -864,17 +983,47 @@ where
             } else {
                 trace!(conn_id, bytes = data.len(), flags, "ME->C data");
             }
-            bytes_me2c.fetch_add(data.len() as u64, Ordering::Relaxed);
-            stats.add_user_octets_to(user, data.len() as u64);
-            write_client_payload(
-                client_writer,
-                proto_tag,
-                flags,
-                &data,
-                rng,
-                frame_buf,
-            )
-            .await?;
+            let data_len = data.len() as u64;
+            if let Some(limit) = quota_limit {
+                let quota_lock = quota_user_lock(user);
+                let _quota_guard = quota_lock.lock().await;
+                if quota_would_be_exceeded_for_user(stats, user, Some(limit), data_len) {
+                    return Err(ProxyError::DataQuotaExceeded {
+                        user: user.to_string(),
+                    });
+                }
+                write_client_payload(
+                    client_writer,
+                    proto_tag,
+                    flags,
+                    &data,
+                    rng,
+                    frame_buf,
+                )
+                .await?;
+
+                bytes_me2c.fetch_add(data.len() as u64, Ordering::Relaxed);
+                stats.add_user_octets_to(user, data.len() as u64);
+
+                if quota_exceeded_for_user(stats, user, Some(limit)) {
+                    return Err(ProxyError::DataQuotaExceeded {
+                        user: user.to_string(),
+                    });
+                }
+            } else {
+                write_client_payload(
+                    client_writer,
+                    proto_tag,
+                    flags,
+                    &data,
+                    rng,
+                    frame_buf,
+                )
+                .await?;
+
+                bytes_me2c.fetch_add(data.len() as u64, Ordering::Relaxed);
+                stats.add_user_octets_to(user, data.len() as u64);
+            }
 
             Ok(MeWriterResponseOutcome::Continue {
                 frames: 1,
@@ -1020,84 +1169,5 @@ where
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use tokio::time::{Duration as TokioDuration, timeout};
-
-    #[test]
-    fn should_yield_sender_only_on_budget_with_backlog() {
-        assert!(!should_yield_c2me_sender(0, true));
-        assert!(!should_yield_c2me_sender(C2ME_SENDER_FAIRNESS_BUDGET - 1, true));
-        assert!(!should_yield_c2me_sender(C2ME_SENDER_FAIRNESS_BUDGET, false));
-        assert!(should_yield_c2me_sender(C2ME_SENDER_FAIRNESS_BUDGET, true));
-    }
-
-    #[tokio::test]
-    async fn enqueue_c2me_command_uses_try_send_fast_path() {
-        let (tx, mut rx) = mpsc::channel::<C2MeCommand>(2);
-        enqueue_c2me_command(
-            &tx,
-            C2MeCommand::Data {
-                payload: Bytes::from_static(&[1, 2, 3]),
-                flags: 0,
-            },
-            TokioDuration::from_millis(50),
-        )
-        .await
-        .unwrap();
-
-        let recv = timeout(TokioDuration::from_millis(50), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        match recv {
-            C2MeCommand::Data { payload, flags } => {
-                assert_eq!(payload.as_ref(), &[1, 2, 3]);
-                assert_eq!(flags, 0);
-            }
-            C2MeCommand::Close => panic!("unexpected close command"),
-        }
-    }
-
-    #[tokio::test]
-    async fn enqueue_c2me_command_falls_back_to_send_when_queue_is_full() {
-        let (tx, mut rx) = mpsc::channel::<C2MeCommand>(1);
-        tx.send(C2MeCommand::Data {
-            payload: Bytes::from_static(&[9]),
-            flags: 9,
-        })
-        .await
-        .unwrap();
-
-        let tx2 = tx.clone();
-        let producer = tokio::spawn(async move {
-            enqueue_c2me_command(
-                &tx2,
-                C2MeCommand::Data {
-                    payload: Bytes::from_static(&[7, 7]),
-                    flags: 7,
-                },
-                TokioDuration::from_millis(100),
-            )
-            .await
-            .unwrap();
-        });
-
-        let _ = timeout(TokioDuration::from_millis(100), rx.recv())
-            .await
-            .unwrap();
-        producer.await.unwrap();
-
-        let recv = timeout(TokioDuration::from_millis(100), rx.recv())
-            .await
-            .unwrap()
-            .unwrap();
-        match recv {
-            C2MeCommand::Data { payload, flags } => {
-                assert_eq!(payload.as_ref(), &[7, 7]);
-                assert_eq!(flags, 7);
-            }
-            C2MeCommand::Close => panic!("unexpected close command"),
-        }
-    }
-}
+#[path = "middle_relay_security_tests.rs"]
+mod security_tests;
