@@ -1,0 +1,54 @@
+name: Build telemt for OpenBSD aarch64
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openbsd-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+          submodules: false
+
+      - name: Compile in OpenBSD VM
+        uses: vmactions/openbsd-vm@3fafb45f2e2e696249c583835939323fe1c3448c # v1
+        with:
+          release: "7.8"
+          arch: aarch64
+          usesh: true
+          sync: sshfs
+          envs: 'RUSTFLAGS'
+          prepare: |
+            pkg_add rust
+          run: |
+            cargo build --release
+        env:
+          RUSTFLAGS: "-C target-cpu=cortex-a53 -C target-feature=+aes,+pmull,+sha2,+sha1,+crc -C opt-level=3"
+
+      - name: Verify artifact exists
+        run: |
+          test -f target/release/telemt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: telemt-openbsd-aarch64
+          path: target/release/telemt
+          if-no-files-found: error
+          retention-days: 7
