@@ -27,6 +27,13 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # ===== GNU / glibc =====
+          - target: x86_64-unknown-linux-gnu
+            asset_name: telemt-x86_64-linux-gnu
+          - target: aarch64-unknown-linux-gnu
+            asset_name: telemt-aarch64-linux-gnu
+
+          # ===== MUSL =====
           - target: x86_64-unknown-linux-musl
             asset_name: telemt-x86_64-linux-musl
           - target: aarch64-unknown-linux-musl
@@ -54,15 +61,21 @@ jobs:
             ~/.cargo/git
             target
           key: ${{ runner.os }}-${{ matrix.target }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-${{ matrix.target }}-
 
       - name: Build
+        env:
+          RUSTFLAGS: ${{ contains(matrix.target, 'musl') && '-C target-feature=+crt-static' || '' }}
         run: cross build --release --target ${{ matrix.target }}
 
       - name: Package
         run: |
           mkdir -p dist
+
           BIN=target/${{ matrix.target }}/release/${{ env.BINARY_NAME }}
 
+          # уникальное имя бинаря
           cp "$BIN" dist/${{ env.BINARY_NAME }}-${{ matrix.target }}
 
           cd dist
@@ -94,7 +107,7 @@ jobs:
           mkdir dist
           find artifacts -name "*.tar.gz" -exec tar -xzf {} -C dist \;
 
-          # нормализуем имя
+          # используем musl как runtime бинарь
           cp dist/telemt-x86_64-unknown-linux-musl dist/telemt || true
 
       - uses: docker/setup-qemu-action@v3
@@ -111,7 +124,6 @@ jobs:
         id: vars
         run: echo "VERSION=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
 
-      # 🟢 prod (distroless)
       - name: Build & Push prod
         uses: docker/build-push-action@v6
         with:
@@ -125,7 +137,6 @@ jobs:
           build-args: |
             BINARY=dist/telemt
 
-      # 🟡 debug
       - name: Build & Push debug
         uses: docker/build-push-action@v6
         with:
