@@ -32,8 +32,16 @@ async fn run_self_target_refusal(
     let (mut client, server) = duplex(1024);
     let started = Instant::now();
     let task = tokio::spawn(async move {
-        handle_bad_client(server, tokio::io::sink(), initial, peer, local_addr, &config, &beobachten)
-            .await;
+        handle_bad_client(
+            server,
+            tokio::io::sink(),
+            initial,
+            peer,
+            local_addr,
+            &config,
+            &beobachten,
+        )
+        .await;
     });
 
     client

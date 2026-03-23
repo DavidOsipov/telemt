@@ -5,10 +5,13 @@ use crate::stream::BufferPool;
 use rand::rngs::StdRng;
 use rand::{RngExt, SeedableRng};
 use std::sync::Arc;
-use tokio::io::{duplex, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::time::{Duration, timeout};
 
-async fn read_available<R: tokio::io::AsyncRead + Unpin>(reader: &mut R, budget: Duration) -> usize {
+async fn read_available<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    budget: Duration,
+) -> usize {
     let start = tokio::time::Instant::now();
     let mut total = 0usize;
     let mut buf = [0u8; 128];
@@ -57,16 +60,25 @@ async fn positive_quota_path_forwards_both_directions_within_limit() {
         Arc::new(BufferPool::new()),
     ));
 
-    client_peer.write_all(&[0xAA, 0xBB, 0xCC, 0xDD]).await.unwrap();
+    client_peer
+        .write_all(&[0xAA, 0xBB, 0xCC, 0xDD])
+        .await
+        .unwrap();
     server_peer.read_exact(&mut [0u8; 4]).await.unwrap();
 
-    server_peer.write_all(&[0x11, 0x22, 0x33, 0x44]).await.unwrap();
+    server_peer
+        .write_all(&[0x11, 0x22, 0x33, 0x44])
+        .await
+        .unwrap();
     client_peer.read_exact(&mut [0u8; 4]).await.unwrap();
 
     drop(client_peer);
     drop(server_peer);
 
-    let relay_result = timeout(Duration::from_secs(2), relay).await.unwrap().unwrap();
+    let relay_result = timeout(Duration::from_secs(2), relay)
+        .await
+        .unwrap()
+        .unwrap();
     assert!(relay_result.is_ok());
     assert!(stats.get_user_quota_used(user) <= 16);
 }
@@ -98,11 +110,23 @@ async fn negative_preloaded_quota_forbids_any_forwarding() {
     client_peer.write_all(&[0xAA]).await.unwrap();
     server_peer.write_all(&[0xBB]).await.unwrap();
 
-    assert_eq!(read_available(&mut server_peer, Duration::from_millis(120)).await, 0);
-    assert_eq!(read_available(&mut client_peer, Duration::from_millis(120)).await, 0);
+    assert_eq!(
+        read_available(&mut server_peer, Duration::from_millis(120)).await,
+        0
+    );
+    assert_eq!(
+        read_available(&mut client_peer, Duration::from_millis(120)).await,
+        0
+    );
 
-    let relay_result = timeout(Duration::from_secs(2), relay).await.unwrap().unwrap();
-    assert!(matches!(relay_result, Err(ProxyError::DataQuotaExceeded { .. })));
+    let relay_result = timeout(Duration::from_secs(2), relay)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        relay_result,
+        Err(ProxyError::DataQuotaExceeded { .. })
+    ));
     assert!(stats.get_user_quota_used(user) <= 8);
 }
 
@@ -135,13 +159,25 @@ async fn edge_quota_one_ensures_at_most_one_byte_across_directions() {
     );
 
     let mut buf = [0u8; 1];
-    let delivered_s2c = timeout(Duration::from_millis(120), client_peer.read(&mut buf)).await.unwrap().unwrap_or(0);
-    let delivered_c2s = timeout(Duration::from_millis(120), server_peer.read(&mut buf)).await.unwrap().unwrap_or(0);
+    let delivered_s2c = timeout(Duration::from_millis(120), client_peer.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap_or(0);
+    let delivered_c2s = timeout(Duration::from_millis(120), server_peer.read(&mut buf))
+        .await
+        .unwrap()
+        .unwrap_or(0);
 
     assert!(delivered_s2c + delivered_c2s <= 1);
 
-    let relay_result = timeout(Duration::from_secs(2), relay).await.unwrap().unwrap();
-    assert!(matches!(relay_result, Err(ProxyError::DataQuotaExceeded { .. })));
+    let relay_result = timeout(Duration::from_secs(2), relay)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        relay_result,
+        Err(ProxyError::DataQuotaExceeded { .. })
+    ));
 }
 
 #[tokio::test]
@@ -191,8 +227,14 @@ async fn adversarial_blackhat_alternating_jitter_does_not_overshoot_quota() {
         tokio::time::sleep(Duration::from_millis(((i % 3) + 1) as u64)).await;
     }
 
-    let relay_result = timeout(Duration::from_secs(3), relay).await.unwrap().unwrap();
-    assert!(matches!(relay_result, Err(ProxyError::DataQuotaExceeded { .. })));
+    let relay_result = timeout(Duration::from_secs(3), relay)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(matches!(
+        relay_result,
+        Err(ProxyError::DataQuotaExceeded { .. })
+    ));
     assert!(total_forwarded <= quota as usize);
     assert!(stats.get_user_quota_used(user) <= quota);
 }
@@ -239,13 +281,17 @@ async fn light_fuzz_random_quota_schedule_preserves_quota_invariants() {
             if rng.random::<bool>() {
                 let _ = client_peer.write_all(&[rng.random::<u8>()]).await;
                 let mut one = [0u8; 1];
-                if let Ok(Ok(n)) = timeout(Duration::from_millis(4), server_peer.read(&mut one)).await {
+                if let Ok(Ok(n)) =
+                    timeout(Duration::from_millis(4), server_peer.read(&mut one)).await
+                {
                     total_forwarded += n;
                 }
             } else {
                 let _ = server_peer.write_all(&[rng.random::<u8>()]).await;
                 let mut one = [0u8; 1];
-                if let Ok(Ok(n)) = timeout(Duration::from_millis(4), client_peer.read(&mut one)).await {
+                if let Ok(Ok(n)) =
+                    timeout(Duration::from_millis(4), client_peer.read(&mut one)).await
+                {
                     total_forwarded += n;
                 }
             }
@@ -254,8 +300,14 @@ async fn light_fuzz_random_quota_schedule_preserves_quota_invariants() {
         drop(client_peer);
         drop(server_peer);
 
-        let relay_result = timeout(Duration::from_secs(2), relay).await.unwrap().unwrap();
-        assert!(relay_result.is_ok() || matches!(relay_result, Err(ProxyError::DataQuotaExceeded { .. })));
+        let relay_result = timeout(Duration::from_secs(2), relay)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            relay_result.is_ok()
+                || matches!(relay_result, Err(ProxyError::DataQuotaExceeded { .. }))
+        );
         assert!(total_forwarded <= quota as usize);
         assert!(stats.get_user_quota_used(&user) <= quota);
     }
@@ -305,13 +357,17 @@ async fn stress_parallel_relays_for_one_user_obey_global_quota() {
                 if (step as usize + worker as usize) % 2 == 0 {
                     let _ = client_peer.write_all(&[(step ^ 0x5A)]).await;
                     let mut one = [0u8; 1];
-                    if let Ok(Ok(n)) = timeout(Duration::from_millis(6), server_peer.read(&mut one)).await {
+                    if let Ok(Ok(n)) =
+                        timeout(Duration::from_millis(6), server_peer.read(&mut one)).await
+                    {
                         total += n;
                     }
                 } else {
                     let _ = server_peer.write_all(&[(step ^ 0xA5)]).await;
                     let mut one = [0u8; 1];
-                    if let Ok(Ok(n)) = timeout(Duration::from_millis(6), client_peer.read(&mut one)).await {
+                    if let Ok(Ok(n)) =
+                        timeout(Duration::from_millis(6), client_peer.read(&mut one)).await
+                    {
                         total += n;
                     }
                 }
@@ -321,8 +377,14 @@ async fn stress_parallel_relays_for_one_user_obey_global_quota() {
             drop(client_peer);
             drop(server_peer);
 
-            let relay_result = timeout(Duration::from_secs(2), relay).await.unwrap().unwrap();
-            assert!(relay_result.is_ok() || matches!(relay_result, Err(ProxyError::DataQuotaExceeded { .. })));
+            let relay_result = timeout(Duration::from_secs(2), relay)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                relay_result.is_ok()
+                    || matches!(relay_result, Err(ProxyError::DataQuotaExceeded { .. }))
+            );
             total
         }));
     }

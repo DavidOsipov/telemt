@@ -381,7 +381,9 @@ impl Stats {
             return;
         }
         Self::touch_user_stats(user_stats);
-        user_stats.octets_from_client.fetch_add(bytes, Ordering::Relaxed);
+        user_stats
+            .octets_from_client
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     #[inline]
@@ -390,7 +392,9 @@ impl Stats {
             return;
         }
         Self::touch_user_stats(user_stats);
-        user_stats.octets_to_client.fetch_add(bytes, Ordering::Relaxed);
+        user_stats
+            .octets_to_client
+            .fetch_add(bytes, Ordering::Relaxed);
     }
 
     #[inline]
@@ -812,7 +816,8 @@ impl Stats {
     }
     pub fn increment_me_d2c_data_frames_total(&self) {
         if self.telemetry_me_allows_normal() {
-            self.me_d2c_data_frames_total.fetch_add(1, Ordering::Relaxed);
+            self.me_d2c_data_frames_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
     pub fn increment_me_d2c_ack_frames_total(&self) {
@@ -1708,7 +1713,8 @@ impl Stats {
         self.me_d2c_batch_bytes_bucket_1k_4k.load(Ordering::Relaxed)
     }
     pub fn get_me_d2c_batch_bytes_bucket_4k_16k(&self) -> u64 {
-        self.me_d2c_batch_bytes_bucket_4k_16k.load(Ordering::Relaxed)
+        self.me_d2c_batch_bytes_bucket_4k_16k
+            .load(Ordering::Relaxed)
     }
     pub fn get_me_d2c_batch_bytes_bucket_16k_64k(&self) -> u64 {
         self.me_d2c_batch_bytes_bucket_16k_64k
@@ -2371,8 +2377,8 @@ impl ReplayStats {
 mod tests {
     use super::*;
     use crate::config::MeTelemetryLevel;
-    use std::sync::atomic::{AtomicU64, Ordering};
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn test_stats_shared_counters() {

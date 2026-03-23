@@ -1,5 +1,5 @@
 use super::*;
-use crate::crypto::{sha256, sha256_hmac, AesCtr, SecureRandom};
+use crate::crypto::{AesCtr, SecureRandom, sha256, sha256_hmac};
 use crate::protocol::constants::{ProtoTag, TLS_RECORD_HANDSHAKE, TLS_VERSION};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::sync::Arc;
@@ -80,8 +80,7 @@ fn make_valid_tls_client_hello_with_alpn(
         digest[28 + i] ^= ts[i];
     }
 
-    record[tls::TLS_DIGEST_POS..tls::TLS_DIGEST_POS + tls::TLS_DIGEST_LEN]
-        .copy_from_slice(&digest);
+    record[tls::TLS_DIGEST_POS..tls::TLS_DIGEST_POS + tls::TLS_DIGEST_LEN].copy_from_slice(&digest);
 
     record
 }
@@ -331,7 +330,11 @@ async fn saturation_grace_exhaustion_under_concurrency_keeps_peer_throttled() {
 
     let final_state = state.get(&peer_ip).expect("state must exist");
     assert!(
-        final_state.fail_streak >= AUTH_PROBE_BACKOFF_START_FAILS + AUTH_PROBE_SATURATION_GRACE_FAILS
+        final_state.fail_streak
+            >= AUTH_PROBE_BACKOFF_START_FAILS + AUTH_PROBE_SATURATION_GRACE_FAILS
     );
-    assert!(auth_probe_should_apply_preauth_throttle(peer_ip, Instant::now()));
+    assert!(auth_probe_should_apply_preauth_throttle(
+        peer_ip,
+        Instant::now()
+    ));
 }

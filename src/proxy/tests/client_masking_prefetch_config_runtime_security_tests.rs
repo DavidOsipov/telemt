@@ -29,7 +29,10 @@ async fn configured_prefetch_budget_20ms_recovers_tail_delayed_15ms() {
             .write_all(b"ONNECT example.org:443 HTTP/1.1\r\n")
             .await
             .expect("tail bytes must be writable");
-        writer.shutdown().await.expect("writer shutdown must succeed");
+        writer
+            .shutdown()
+            .await
+            .expect("writer shutdown must succeed");
     });
 
     let mut initial_data = b"C".to_vec();
@@ -60,7 +63,10 @@ async fn configured_prefetch_budget_5ms_misses_tail_delayed_15ms() {
             .write_all(b"ONNECT example.org:443 HTTP/1.1\r\n")
             .await
             .expect("tail bytes must be writable");
-        writer.shutdown().await.expect("writer shutdown must succeed");
+        writer
+            .shutdown()
+            .await
+            .expect("writer shutdown must succeed");
     });
 
     let mut initial_data = b"C".to_vec();

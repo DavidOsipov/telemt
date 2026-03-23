@@ -1,6 +1,6 @@
 use super::*;
-use std::net::TcpListener as StdTcpListener;
 use std::net::SocketAddr;
+use std::net::TcpListener as StdTcpListener;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::net::TcpListener;
 use tokio::time::{Duration, Instant, timeout};
@@ -15,74 +15,38 @@ fn closed_local_port() -> u16 {
 #[tokio::test]
 async fn self_target_detection_matches_literal_ipv4_listener() {
     let local: SocketAddr = "198.51.100.40:443".parse().unwrap();
-    assert!(is_mask_target_local_listener_async(
-        "198.51.100.40",
-        443,
-        local,
-        None,
-    )
-    .await);
+    assert!(is_mask_target_local_listener_async("198.51.100.40", 443, local, None,).await);
 }
 
 #[tokio::test]
 async fn self_target_detection_matches_bracketed_ipv6_listener() {
     let local: SocketAddr = "[2001:db8::44]:8443".parse().unwrap();
-    assert!(is_mask_target_local_listener_async(
-        "[2001:db8::44]",
-        8443,
-        local,
-        None,
-    )
-    .await);
+    assert!(is_mask_target_local_listener_async("[2001:db8::44]", 8443, local, None,).await);
 }
 
 #[tokio::test]
 async fn self_target_detection_keeps_same_ip_different_port_forwardable() {
     let local: SocketAddr = "203.0.113.44:443".parse().unwrap();
-    assert!(!is_mask_target_local_listener_async(
-        "203.0.113.44",
-        8443,
-        local,
-        None,
-    )
-    .await);
+    assert!(!is_mask_target_local_listener_async("203.0.113.44", 8443, local, None,).await);
 }
 
 #[tokio::test]
 async fn self_target_detection_normalizes_ipv4_mapped_ipv6_literal() {
     let local: SocketAddr = "127.0.0.1:443".parse().unwrap();
-    assert!(is_mask_target_local_listener_async(
-        "::ffff:127.0.0.1",
-        443,
-        local,
-        None,
-    )
-    .await);
+    assert!(is_mask_target_local_listener_async("::ffff:127.0.0.1", 443, local, None,).await);
 }
 
 #[tokio::test]
 async fn self_target_detection_unspecified_bind_blocks_loopback_target() {
     let local: SocketAddr = "0.0.0.0:443".parse().unwrap();
-    assert!(is_mask_target_local_listener_async(
-        "127.0.0.1",
-        443,
-        local,
-        None,
-    )
-    .await);
+    assert!(is_mask_target_local_listener_async("127.0.0.1", 443, local, None,).await);
 }
 
 #[tokio::test]
 async fn self_target_detection_unspecified_bind_keeps_remote_target_forwardable() {
     let local: SocketAddr = "0.0.0.0:443".parse().unwrap();
     let remote: SocketAddr = "198.51.100.44:443".parse().unwrap();
-    assert!(!is_mask_target_local_listener_async(
-        "mask.example",
-        443,
-        local,
-        Some(remote),
-    )
-    .await);
+    assert!(!is_mask_target_local_listener_async("mask.example", 443, local, Some(remote),).await);
 }
 
 #[tokio::test]
@@ -306,7 +270,10 @@ async fn offline_mask_target_refusal_respects_timing_normalization_budget() {
     });
 
     client.shutdown().await.unwrap();
-    timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
+    timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
     let elapsed = started.elapsed();
 
     assert!(
@@ -350,7 +317,10 @@ async fn offline_mask_target_refusal_with_idle_client_is_bounded_by_consume_time
         .await
         .expect("connection should still be open before consume timeout expires");
 
-    timeout(Duration::from_secs(2), task).await.unwrap().unwrap();
+    timeout(Duration::from_secs(2), task)
+        .await
+        .unwrap()
+        .unwrap();
     let elapsed = started.elapsed();
 
     assert!(

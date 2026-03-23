@@ -23,7 +23,9 @@ use crate::proxy::route_mode::{
     ROUTE_SWITCH_ERROR_MSG, RelayRouteMode, RouteCutoverState, affected_cutover_state,
     cutover_stagger_delay,
 };
-use crate::stats::{MeD2cFlushReason, MeD2cQuotaRejectStage, MeD2cWriteMode, QuotaReserveError, Stats, UserStats};
+use crate::stats::{
+    MeD2cFlushReason, MeD2cQuotaRejectStage, MeD2cWriteMode, QuotaReserveError, Stats, UserStats,
+};
 use crate::stream::{BufferPool, CryptoReader, CryptoWriter, PooledBuffer};
 use crate::transport::middle_proxy::{MePool, MeResponse, proto_flags_for_tag};
 
@@ -91,7 +93,8 @@ fn relay_idle_candidate_registry() -> &'static Mutex<RelayIdleCandidateRegistry>
     RELAY_IDLE_CANDIDATE_REGISTRY.get_or_init(|| Mutex::new(RelayIdleCandidateRegistry::default()))
 }
 
-fn relay_idle_candidate_registry_lock() -> std::sync::MutexGuard<'static, RelayIdleCandidateRegistry> {
+fn relay_idle_candidate_registry_lock() -> std::sync::MutexGuard<'static, RelayIdleCandidateRegistry>
+{
     let registry = relay_idle_candidate_registry();
     match registry.lock() {
         Ok(guard) => guard,
@@ -1520,8 +1523,7 @@ where
             }
 
             if !idle_policy.enabled {
-                consecutive_zero_len_frames =
-                    consecutive_zero_len_frames.saturating_add(1);
+                consecutive_zero_len_frames = consecutive_zero_len_frames.saturating_add(1);
                 if consecutive_zero_len_frames > LEGACY_MAX_CONSECUTIVE_ZERO_LEN_FRAMES {
                     stats.increment_relay_protocol_desync_close_total();
                     return Err(ProxyError::Proxy(
@@ -1835,8 +1837,14 @@ where
                     MeD2cWriteMode::Coalesced
                 } else {
                     let header = [first];
-                    client_writer.write_all(&header).await.map_err(ProxyError::Io)?;
-                    client_writer.write_all(data).await.map_err(ProxyError::Io)?;
+                    client_writer
+                        .write_all(&header)
+                        .await
+                        .map_err(ProxyError::Io)?;
+                    client_writer
+                        .write_all(data)
+                        .await
+                        .map_err(ProxyError::Io)?;
                     MeD2cWriteMode::Split
                 }
             } else if len_words < (1 << 24) {
@@ -1858,8 +1866,14 @@ where
                     MeD2cWriteMode::Coalesced
                 } else {
                     let header = [first, lw[0], lw[1], lw[2]];
-                    client_writer.write_all(&header).await.map_err(ProxyError::Io)?;
-                    client_writer.write_all(data).await.map_err(ProxyError::Io)?;
+                    client_writer
+                        .write_all(&header)
+                        .await
+                        .map_err(ProxyError::Io)?;
+                    client_writer
+                        .write_all(data)
+                        .await
+                        .map_err(ProxyError::Io)?;
                     MeD2cWriteMode::Split
                 }
             } else {
@@ -1901,8 +1915,14 @@ where
                 MeD2cWriteMode::Coalesced
             } else {
                 let header = len_val.to_le_bytes();
-                client_writer.write_all(&header).await.map_err(ProxyError::Io)?;
-                client_writer.write_all(data).await.map_err(ProxyError::Io)?;
+                client_writer
+                    .write_all(&header)
+                    .await
+                    .map_err(ProxyError::Io)?;
+                client_writer
+                    .write_all(data)
+                    .await
+                    .map_err(ProxyError::Io)?;
                 if padding_len > 0 {
                     frame_buf.clear();
                     if frame_buf.capacity() < padding_len {

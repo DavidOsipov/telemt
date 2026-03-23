@@ -7,7 +7,9 @@ async fn run_strict_prefetch_case(prefetch_ms: u64, tail_delay_ms: u64) -> Vec<u
 
     let writer_task = tokio::spawn(async move {
         sleep(Duration::from_millis(tail_delay_ms)).await;
-        let _ = writer.write_all(b"ONNECT example.org:443 HTTP/1.1\r\n").await;
+        let _ = writer
+            .write_all(b"ONNECT example.org:443 HTTP/1.1\r\n")
+            .await;
         let _ = writer.shutdown().await;
     });
 

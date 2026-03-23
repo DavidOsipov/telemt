@@ -2,8 +2,8 @@ use super::*;
 use crate::crypto::AesCtr;
 use crate::stats::Stats;
 use crate::stream::{BufferPool, CryptoReader};
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
 use tokio::io::{AsyncRead, AsyncWriteExt, duplex};
 
@@ -156,7 +156,10 @@ fn alternating_one_to_one_closes_with_bounded_real_frame_count() {
     }
     let (closed_at, _, reals) = simulate_tiny_debt_pattern(&pattern, pattern.len());
     assert!(closed_at.is_some());
-    assert!(reals <= 80, "expected bounded real frames before close, got {reals}");
+    assert!(
+        reals <= 80,
+        "expected bounded real frames before close, got {reals}"
+    );
 }
 
 #[test]
@@ -183,7 +186,10 @@ fn alternating_one_to_seven_eventually_closes() {
         }
     }
     let (closed_at, _, _) = simulate_tiny_debt_pattern(&pattern, pattern.len());
-    assert!(closed_at.is_some(), "1:7 tiny-to-real must eventually close");
+    assert!(
+        closed_at.is_some(),
+        "1:7 tiny-to-real must eventually close"
+    );
 }
 
 #[test]

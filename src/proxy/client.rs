@@ -210,7 +210,9 @@ fn should_prefetch_mask_classifier_window(initial_data: &[u8]) -> bool {
         return false;
     }
 
-    initial_data.iter().all(|b| b.is_ascii_alphabetic() || *b == b' ')
+    initial_data
+        .iter()
+        .all(|b| b.is_ascii_alphabetic() || *b == b' ')
 }
 
 #[cfg(test)]
@@ -218,16 +220,19 @@ async fn extend_masking_initial_window<R>(reader: &mut R, initial_data: &mut Vec
 where
     R: AsyncRead + Unpin,
 {
-    extend_masking_initial_window_with_timeout(reader, initial_data, MASK_CLASSIFIER_PREFETCH_TIMEOUT)
-        .await;
+    extend_masking_initial_window_with_timeout(
+        reader,
+        initial_data,
+        MASK_CLASSIFIER_PREFETCH_TIMEOUT,
+    )
+    .await;
 }
 
 async fn extend_masking_initial_window_with_timeout<R>(
     reader: &mut R,
     initial_data: &mut Vec<u8>,
     prefetch_timeout: Duration,
-)
-where
+) where
     R: AsyncRead + Unpin,
 {
     if !should_prefetch_mask_classifier_window(initial_data) {

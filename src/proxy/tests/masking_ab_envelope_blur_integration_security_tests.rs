@@ -544,7 +544,6 @@ async fn timing_classifier_light_fuzz_pairwise_bucketed_accuracy_stays_bounded_u
         if hardened_acc + 0.05 <= baseline_acc {
             meaningful_improvement_seen = true;
         }
-
     }
 
     assert!(

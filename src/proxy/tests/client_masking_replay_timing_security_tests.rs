@@ -67,9 +67,10 @@ async fn run_replay_candidate_session(
     cfg.censorship.mask_port = 1;
     cfg.censorship.mask_timing_normalization_enabled = false;
     cfg.access.ignore_time_skew = true;
-    cfg.access
-        .users
-        .insert("user".to_string(), "abababababababababababababababab".to_string());
+    cfg.access.users.insert(
+        "user".to_string(),
+        "abababababababababababababababab".to_string(),
+    );
 
     let config = Arc::new(cfg);
     let stats = Arc::new(Stats::new());
@@ -99,7 +100,10 @@ async fn run_replay_candidate_session(
 
     if drive_mtproto_fail {
         let mut server_hello_head = [0u8; 5];
-        client_side.read_exact(&mut server_hello_head).await.unwrap();
+        client_side
+            .read_exact(&mut server_hello_head)
+            .await
+            .unwrap();
         assert_eq!(server_hello_head[0], 0x16);
         let body_len = u16::from_be_bytes([server_hello_head[3], server_hello_head[4]]) as usize;
         let mut body = vec![0u8; body_len];
@@ -110,7 +114,10 @@ async fn run_replay_candidate_session(
         invalid_mtproto_record.extend_from_slice(&TLS_VERSION);
         invalid_mtproto_record.extend_from_slice(&(HANDSHAKE_LEN as u16).to_be_bytes());
         invalid_mtproto_record.extend_from_slice(&vec![0u8; HANDSHAKE_LEN]);
-        client_side.write_all(&invalid_mtproto_record).await.unwrap();
+        client_side
+            .write_all(&invalid_mtproto_record)
+            .await
+            .unwrap();
         client_side
             .write_all(b"GET /replay-fallback HTTP/1.1\r\nHost: x\r\n\r\n")
             .await
@@ -154,8 +161,7 @@ async fn replay_reject_still_honors_masking_timing_budget() {
     .await;
 
     assert!(
-        replay_elapsed >= Duration::from_millis(40)
-            && replay_elapsed < Duration::from_millis(250),
+        replay_elapsed >= Duration::from_millis(40) && replay_elapsed < Duration::from_millis(250),
         "replay rejection path must still satisfy masking timing budget without unbounded DB/CPU delay"
     );
 }

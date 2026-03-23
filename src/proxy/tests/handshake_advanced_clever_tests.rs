@@ -1,5 +1,5 @@
 use super::*;
-use crate::crypto::{sha256, sha256_hmac, AesCtr};
+use crate::crypto::{AesCtr, sha256, sha256_hmac};
 use crate::protocol::constants::{ProtoTag, RESERVED_NONCE_BEGINNINGS, RESERVED_NONCE_FIRST_BYTES};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -175,7 +175,10 @@ async fn tls_minimum_viable_length_boundary() {
         None,
     )
     .await;
-    assert!(matches!(res, HandshakeResult::Success(_)), "Exact minimum length TLS handshake must succeed");
+    assert!(
+        matches!(res, HandshakeResult::Success(_)),
+        "Exact minimum length TLS handshake must succeed"
+    );
 
     let short_handshake = vec![0x42u8; min_len - 1];
     let res_short = handle_tls_handshake(
@@ -189,7 +192,10 @@ async fn tls_minimum_viable_length_boundary() {
         None,
     )
     .await;
-    assert!(matches!(res_short, HandshakeResult::BadClient { .. }), "Handshake 1 byte shorter than minimum must fail closed");
+    assert!(
+        matches!(res_short, HandshakeResult::BadClient { .. }),
+        "Handshake 1 byte shorter than minimum must fail closed"
+    );
 }
 
 #[tokio::test]
@@ -219,9 +225,16 @@ async fn mtproto_extreme_dc_index_serialization() {
 
         match res {
             HandshakeResult::Success((_, _, success)) => {
-                assert_eq!(success.dc_idx, extreme_dc, "Extreme DC index {} must serialize/deserialize perfectly", extreme_dc);
+                assert_eq!(
+                    success.dc_idx, extreme_dc,
+                    "Extreme DC index {} must serialize/deserialize perfectly",
+                    extreme_dc
+                );
             }
-            _ => panic!("MTProto handshake with extreme DC index {} failed", extreme_dc),
+            _ => panic!(
+                "MTProto handshake with extreme DC index {} failed",
+                extreme_dc
+            ),
         }
     }
 }
@@ -253,7 +266,11 @@ async fn alpn_strict_case_and_padding_rejection() {
             None,
         )
         .await;
-        assert!(matches!(res, HandshakeResult::BadClient { .. }), "ALPN strict enforcement must reject {:?}", bad_alpn);
+        assert!(
+            matches!(res, HandshakeResult::BadClient { .. }),
+            "ALPN strict enforcement must reject {:?}",
+            bad_alpn
+        );
     }
 }
 
@@ -265,8 +282,15 @@ fn ipv4_mapped_ipv6_bucketing_anomaly() {
     let norm_1 = normalize_auth_probe_ip(ipv4_mapped_1);
     let norm_2 = normalize_auth_probe_ip(ipv4_mapped_2);
 
-    assert_eq!(norm_1, norm_2, "IPv4-mapped IPv6 addresses must collapse into the same /64 bucket (::0)");
-    assert_eq!(norm_1, IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)), "The bucket must be exactly ::0");
+    assert_eq!(
+        norm_1, norm_2,
+        "IPv4-mapped IPv6 addresses must collapse into the same /64 bucket (::0)"
+    );
+    assert_eq!(
+        norm_1,
+        IpAddr::V6(Ipv6Addr::new(0, 0, 0, 0, 0, 0, 0, 0)),
+        "The bucket must be exactly ::0"
+    );
 }
 
 // --- Category 2: Adversarial & Black Hat ---
@@ -309,7 +333,10 @@ async fn mtproto_invalid_ciphertext_does_not_poison_replay_cache() {
         None,
     )
     .await;
-    assert!(matches!(res_valid, HandshakeResult::Success(_)), "Invalid MTProto ciphertext must not poison the replay cache");
+    assert!(
+        matches!(res_valid, HandshakeResult::Success(_)),
+        "Invalid MTProto ciphertext must not poison the replay cache"
+    );
 }
 
 #[tokio::test]
@@ -352,7 +379,10 @@ async fn tls_invalid_session_does_not_poison_replay_cache() {
         None,
     )
     .await;
-    assert!(matches!(res_valid, HandshakeResult::Success(_)), "Invalid TLS payload must not poison the replay cache");
+    assert!(
+        matches!(res_valid, HandshakeResult::Success(_)),
+        "Invalid TLS payload must not poison the replay cache"
+    );
 }
 
 #[tokio::test]
@@ -387,7 +417,10 @@ async fn server_hello_delay_timing_neutrality_on_hmac_failure() {
     let elapsed = start.elapsed();
 
     assert!(matches!(res, HandshakeResult::BadClient { .. }));
-    assert!(elapsed >= Duration::from_millis(45), "Invalid HMAC must still incur the configured ServerHello delay to prevent timing side-channels");
+    assert!(
+        elapsed >= Duration::from_millis(45),
+        "Invalid HMAC must still incur the configured ServerHello delay to prevent timing side-channels"
+    );
 }
 
 #[tokio::test]
@@ -421,7 +454,10 @@ async fn server_hello_delay_inversion_resilience() {
     let elapsed = start.elapsed();
 
     assert!(matches!(res, HandshakeResult::Success(_)));
-    assert!(elapsed >= Duration::from_millis(90), "Delay logic must gracefully handle min > max inversions via max.max(min)");
+    assert!(
+        elapsed >= Duration::from_millis(90),
+        "Delay logic must gracefully handle min > max inversions via max.max(min)"
+    );
 }
 
 #[tokio::test]
@@ -436,10 +472,16 @@ async fn mixed_valid_and_invalid_user_secrets_configuration() {
 
     for i in 0..9 {
         let bad_secret = if i % 2 == 0 { "badhex!" } else { "1122" };
-        config.access.users.insert(format!("bad_user_{}", i), bad_secret.to_string());
+        config
+            .access
+            .users
+            .insert(format!("bad_user_{}", i), bad_secret.to_string());
     }
     let valid_secret_hex = "99999999999999999999999999999999";
-    config.access.users.insert("good_user".to_string(), valid_secret_hex.to_string());
+    config
+        .access
+        .users
+        .insert("good_user".to_string(), valid_secret_hex.to_string());
     config.general.modes.secure = true;
     config.general.modes.classic = true;
     config.general.modes.tls = true;
@@ -463,7 +505,10 @@ async fn mixed_valid_and_invalid_user_secrets_configuration() {
     )
     .await;
 
-    assert!(matches!(res, HandshakeResult::Success(_)), "Proxy must gracefully skip invalid secrets and authenticate the valid one");
+    assert!(
+        matches!(res, HandshakeResult::Success(_)),
+        "Proxy must gracefully skip invalid secrets and authenticate the valid one"
+    );
 }
 
 #[tokio::test]
@@ -494,7 +539,10 @@ async fn tls_emulation_fallback_when_cache_missing() {
     )
     .await;
 
-    assert!(matches!(res, HandshakeResult::Success(_)), "TLS emulation must gracefully fall back to standard ServerHello if cache is missing");
+    assert!(
+        matches!(res, HandshakeResult::Success(_)),
+        "TLS emulation must gracefully fall back to standard ServerHello if cache is missing"
+    );
 }
 
 #[tokio::test]
@@ -524,7 +572,10 @@ async fn classic_mode_over_tls_transport_protocol_confusion() {
     )
     .await;
 
-    assert!(matches!(res, HandshakeResult::Success(_)), "Intermediate tag over TLS must succeed if classic mode is enabled, locking in cross-transport behavior");
+    assert!(
+        matches!(res, HandshakeResult::Success(_)),
+        "Intermediate tag over TLS must succeed if classic mode is enabled, locking in cross-transport behavior"
+    );
 }
 
 #[test]
@@ -543,9 +594,15 @@ fn generate_tg_nonce_never_emits_reserved_bytes() {
             false,
         );
 
-        assert!(!RESERVED_NONCE_FIRST_BYTES.contains(&nonce[0]), "Nonce must never start with reserved bytes");
+        assert!(
+            !RESERVED_NONCE_FIRST_BYTES.contains(&nonce[0]),
+            "Nonce must never start with reserved bytes"
+        );
         let first_four: [u8; 4] = [nonce[0], nonce[1], nonce[2], nonce[3]];
-        assert!(!RESERVED_NONCE_BEGINNINGS.contains(&first_four), "Nonce must never match reserved 4-byte beginnings");
+        assert!(
+            !RESERVED_NONCE_BEGINNINGS.contains(&first_four),
+            "Nonce must never match reserved 4-byte beginnings"
+        );
     }
 }
 
@@ -568,11 +625,18 @@ async fn dashmap_concurrent_saturation_stress() {
     }
 
     for task in tasks {
-        task.await.expect("Task panicked during concurrent DashMap stress");
+        task.await
+            .expect("Task panicked during concurrent DashMap stress");
     }
 
-    assert!(auth_probe_is_throttled_for_testing(ip_a), "IP A must be throttled after concurrent stress");
-    assert!(auth_probe_is_throttled_for_testing(ip_b), "IP B must be throttled after concurrent stress");
+    assert!(
+        auth_probe_is_throttled_for_testing(ip_a),
+        "IP A must be throttled after concurrent stress"
+    );
+    assert!(
+        auth_probe_is_throttled_for_testing(ip_b),
+        "IP B must be throttled after concurrent stress"
+    );
 }
 
 #[test]
@@ -586,7 +650,12 @@ fn prototag_invalid_bytes_fail_closed() {
     ];
 
     for tag in invalid_tags {
-        assert_eq!(ProtoTag::from_bytes(tag), None, "Invalid ProtoTag bytes {:?} must fail closed", tag);
+        assert_eq!(
+            ProtoTag::from_bytes(tag),
+            None,
+            "Invalid ProtoTag bytes {:?} must fail closed",
+            tag
+        );
     }
 }
 
@@ -603,7 +672,10 @@ fn auth_probe_eviction_hash_collision_stress() {
         auth_probe_record_failure_with_state(state, ip, now);
     }
 
-    assert!(state.len() <= AUTH_PROBE_TRACK_MAX_ENTRIES, "Eviction logic must successfully bound the map size under heavy insertion stress");
+    assert!(
+        state.len() <= AUTH_PROBE_TRACK_MAX_ENTRIES,
+        "Eviction logic must successfully bound the map size under heavy insertion stress"
+    );
 }
 
 #[test]

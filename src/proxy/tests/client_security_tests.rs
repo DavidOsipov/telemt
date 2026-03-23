@@ -7,9 +7,9 @@ use crate::protocol::tls;
 use crate::proxy::handshake::HandshakeSuccess;
 use crate::stream::{CryptoReader, CryptoWriter};
 use crate::transport::proxy_protocol::ProxyProtocolV1Builder;
-use rand::rngs::StdRng;
 use rand::Rng;
 use rand::SeedableRng;
+use rand::rngs::StdRng;
 use std::net::Ipv4Addr;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 use tokio::net::{TcpListener, TcpStream};
@@ -34,7 +34,10 @@ fn handshake_timeout_with_mask_grace_includes_mask_margin() {
     config.timeouts.client_handshake = 2;
 
     config.censorship.mask = false;
-    assert_eq!(handshake_timeout_with_mask_grace(&config), Duration::from_secs(2));
+    assert_eq!(
+        handshake_timeout_with_mask_grace(&config),
+        Duration::from_secs(2)
+    );
 
     config.censorship.mask = true;
     assert_eq!(
@@ -86,7 +89,10 @@ impl tokio::io::AsyncRead for ErrorReader {
         _cx: &mut std::task::Context<'_>,
         _buf: &mut tokio::io::ReadBuf<'_>,
     ) -> std::task::Poll<std::io::Result<()>> {
-        std::task::Poll::Ready(Err(std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "fake error")))
+        std::task::Poll::Ready(Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "fake error",
+        )))
     }
 }
 
@@ -124,7 +130,10 @@ fn handshake_timeout_without_mask_is_exact_base() {
     config.timeouts.client_handshake = 7;
     config.censorship.mask = false;
 
-    assert_eq!(handshake_timeout_with_mask_grace(&config), Duration::from_secs(7));
+    assert_eq!(
+        handshake_timeout_with_mask_grace(&config),
+        Duration::from_secs(7)
+    );
 }
 
 #[test]
@@ -133,7 +142,10 @@ fn handshake_timeout_mask_enabled_adds_750ms() {
     config.timeouts.client_handshake = 3;
     config.censorship.mask = true;
 
-    assert_eq!(handshake_timeout_with_mask_grace(&config), Duration::from_millis(3750));
+    assert_eq!(
+        handshake_timeout_with_mask_grace(&config),
+        Duration::from_millis(3750)
+    );
 }
 
 #[tokio::test]
@@ -155,10 +167,12 @@ async fn read_with_progress_fragmented_io_works_over_multiple_calls() {
         let mut b = vec![0u8; chunk_size];
         let n = read_with_progress(&mut cursor, &mut b).await.unwrap();
         result.extend_from_slice(&b[..n]);
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
     }
 
-    assert_eq!(result, vec![1,2,3,4,5]);
+    assert_eq!(result, vec![1, 2, 3, 4, 5]);
 }
 
 #[tokio::test]
@@ -174,7 +188,9 @@ async fn read_with_progress_stress_randomized_chunk_sizes() {
             let mut b = vec![0u8; chunk];
             let read = read_with_progress(&mut cursor, &mut b).await.unwrap();
             collected.extend_from_slice(&b[..read]);
-            if read == 0 { break; }
+            if read == 0 {
+                break;
+            }
         }
 
         assert_eq!(collected, input);
@@ -215,10 +231,12 @@ fn wrap_tls_application_record_roundtrip_size_check() {
     let mut consumed = 0;
     while idx + 5 <= wrapped.len() {
         assert_eq!(wrapped[idx], 0x17);
-        let len = u16::from_be_bytes([wrapped[idx+3], wrapped[idx+4]]) as usize;
+        let len = u16::from_be_bytes([wrapped[idx + 3], wrapped[idx + 4]]) as usize;
         consumed += len;
         idx += 5 + len;
-        if idx >= wrapped.len() { break; }
+        if idx >= wrapped.len() {
+            break;
+        }
     }
 
     assert_eq!(consumed, payload_len);

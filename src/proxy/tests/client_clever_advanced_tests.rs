@@ -1,5 +1,5 @@
 use super::*;
-use crate::config::{UpstreamConfig, UpstreamType, ProxyConfig};
+use crate::config::{ProxyConfig, UpstreamConfig, UpstreamType};
 use crate::protocol::constants::{MAX_TLS_PLAINTEXT_SIZE, MIN_TLS_CLIENT_HELLO_SIZE};
 use crate::stats::Stats;
 use crate::transport::UpstreamManager;
@@ -41,7 +41,9 @@ fn edge_handshake_timeout_with_mask_grace_saturating_add_prevents_overflow() {
 #[test]
 fn edge_tls_clienthello_len_in_bounds_exact_boundaries() {
     assert!(tls_clienthello_len_in_bounds(MIN_TLS_CLIENT_HELLO_SIZE));
-    assert!(!tls_clienthello_len_in_bounds(MIN_TLS_CLIENT_HELLO_SIZE - 1));
+    assert!(!tls_clienthello_len_in_bounds(
+        MIN_TLS_CLIENT_HELLO_SIZE - 1
+    ));
     assert!(tls_clienthello_len_in_bounds(MAX_TLS_PLAINTEXT_SIZE));
     assert!(!tls_clienthello_len_in_bounds(MAX_TLS_PLAINTEXT_SIZE + 1));
 }
@@ -87,7 +89,15 @@ async fn adversarial_tls_handshake_timeout_during_masking_delay() {
         "198.51.100.1:55000".parse().unwrap(),
         config,
         stats.clone(),
-        Arc::new(UpstreamManager::new(vec![], 1, 1, 1, 1, false, stats.clone())),
+        Arc::new(UpstreamManager::new(
+            vec![],
+            1,
+            1,
+            1,
+            1,
+            false,
+            stats.clone(),
+        )),
         Arc::new(ReplayChecker::new(128, Duration::from_secs(60))),
         Arc::new(BufferPool::new()),
         Arc::new(SecureRandom::new()),
@@ -99,7 +109,10 @@ async fn adversarial_tls_handshake_timeout_during_masking_delay() {
         false,
     ));
 
-    client_side.write_all(&[0x16, 0x03, 0x01, 0xFF, 0xFF]).await.unwrap();
+    client_side
+        .write_all(&[0x16, 0x03, 0x01, 0xFF, 0xFF])
+        .await
+        .unwrap();
 
     let result = tokio::time::timeout(Duration::from_secs(4), handle)
         .await
@@ -123,7 +136,15 @@ async fn blackhat_proxy_protocol_slowloris_timeout() {
         "198.51.100.2:55000".parse().unwrap(),
         config,
         stats.clone(),
-        Arc::new(UpstreamManager::new(vec![], 1, 1, 1, 1, false, stats.clone())),
+        Arc::new(UpstreamManager::new(
+            vec![],
+            1,
+            1,
+            1,
+            1,
+            false,
+            stats.clone(),
+        )),
         Arc::new(ReplayChecker::new(128, Duration::from_secs(60))),
         Arc::new(BufferPool::new()),
         Arc::new(SecureRandom::new()),
@@ -167,7 +188,15 @@ async fn negative_proxy_protocol_enabled_but_client_sends_tls_hello() {
         "198.51.100.3:55000".parse().unwrap(),
         config,
         stats.clone(),
-        Arc::new(UpstreamManager::new(vec![], 1, 1, 1, 1, false, stats.clone())),
+        Arc::new(UpstreamManager::new(
+            vec![],
+            1,
+            1,
+            1,
+            1,
+            false,
+            stats.clone(),
+        )),
         Arc::new(ReplayChecker::new(128, Duration::from_secs(60))),
         Arc::new(BufferPool::new()),
         Arc::new(SecureRandom::new()),
@@ -179,7 +208,10 @@ async fn negative_proxy_protocol_enabled_but_client_sends_tls_hello() {
         true,
     ));
 
-    client_side.write_all(&[0x16, 0x03, 0x01, 0x02, 0x00]).await.unwrap();
+    client_side
+        .write_all(&[0x16, 0x03, 0x01, 0x02, 0x00])
+        .await
+        .unwrap();
 
     let result = tokio::time::timeout(Duration::from_secs(2), handle)
         .await
@@ -202,7 +234,15 @@ async fn edge_client_stream_exactly_4_bytes_eof() {
         "198.51.100.4:55000".parse().unwrap(),
         config,
         stats.clone(),
-        Arc::new(UpstreamManager::new(vec![], 1, 1, 1, 1, false, stats.clone())),
+        Arc::new(UpstreamManager::new(
+            vec![],
+            1,
+            1,
+            1,
+            1,
+            false,
+            stats.clone(),
+        )),
         Arc::new(ReplayChecker::new(128, Duration::from_secs(60))),
         Arc::new(BufferPool::new()),
         Arc::new(SecureRandom::new()),
@@ -214,7 +254,10 @@ async fn edge_client_stream_exactly_4_bytes_eof() {
         false,
     ));
 
-    client_side.write_all(&[0x16, 0x03, 0x01, 0x00]).await.unwrap();
+    client_side
+        .write_all(&[0x16, 0x03, 0x01, 0x00])
+        .await
+        .unwrap();
     client_side.shutdown().await.unwrap();
 
     let _ = tokio::time::timeout(Duration::from_secs(2), handle).await;
@@ -234,7 +277,15 @@ async fn edge_client_stream_tls_header_valid_but_body_1_byte_short_eof() {
         "198.51.100.5:55000".parse().unwrap(),
         config,
         stats.clone(),
-        Arc::new(UpstreamManager::new(vec![], 1, 1, 1, 1, false, stats.clone())),
+        Arc::new(UpstreamManager::new(
+            vec![],
+            1,
+            1,
+            1,
+            1,
+            false,
+            stats.clone(),
+        )),
         Arc::new(ReplayChecker::new(128, Duration::from_secs(60))),
         Arc::new(BufferPool::new()),
         Arc::new(SecureRandom::new()),
@@ -246,7 +297,10 @@ async fn edge_client_stream_tls_header_valid_but_body_1_byte_short_eof() {
         false,
     ));
 
-    client_side.write_all(&[0x16, 0x03, 0x01, 0x00, 100]).await.unwrap();
+    client_side
+        .write_all(&[0x16, 0x03, 0x01, 0x00, 100])
+        .await
+        .unwrap();
     client_side.write_all(&vec![0x41; 99]).await.unwrap();
     client_side.shutdown().await.unwrap();
 
@@ -269,7 +323,15 @@ async fn integration_non_tls_modes_disabled_immediately_masks() {
         "198.51.100.6:55000".parse().unwrap(),
         config,
         stats.clone(),
-        Arc::new(UpstreamManager::new(vec![], 1, 1, 1, 1, false, stats.clone())),
+        Arc::new(UpstreamManager::new(
+            vec![],
+            1,
+            1,
+            1,
+            1,
+            false,
+            stats.clone(),
+        )),
         Arc::new(ReplayChecker::new(128, Duration::from_secs(60))),
         Arc::new(BufferPool::new()),
         Arc::new(SecureRandom::new()),
@@ -372,11 +434,7 @@ async fn stress_user_connection_reservation_concurrent_same_ip_exhaustion() {
         let ip_tracker = ip_tracker.clone();
         tasks.spawn(async move {
             RunningClientHandler::acquire_user_connection_reservation_static(
-                user,
-                &config,
-                stats,
-                peer,
-                ip_tracker,
+                user, &config, stats, peer, ip_tracker,
             )
             .await
         });

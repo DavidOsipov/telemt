@@ -1,8 +1,8 @@
 use super::*;
-use crate::crypto::{sha256, sha256_hmac, AesCtr};
+use crate::crypto::{AesCtr, sha256, sha256_hmac};
 use crate::protocol::constants::{ProtoTag, RESERVED_NONCE_BEGINNINGS, RESERVED_NONCE_FIRST_BYTES};
-use rand::{Rng, SeedableRng};
 use rand::rngs::StdRng;
+use rand::{Rng, SeedableRng};
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
@@ -223,7 +223,10 @@ fn auth_probe_backoff_extreme_fail_streak_clamps_safely() {
     assert_eq!(updated.fail_streak, u32::MAX);
 
     let expected_blocked_until = now + Duration::from_millis(AUTH_PROBE_BACKOFF_MAX_MS);
-    assert_eq!(updated.blocked_until, expected_blocked_until, "Extreme fail streak must clamp cleanly to AUTH_PROBE_BACKOFF_MAX_MS");
+    assert_eq!(
+        updated.blocked_until, expected_blocked_until,
+        "Extreme fail streak must clamp cleanly to AUTH_PROBE_BACKOFF_MAX_MS"
+    );
 }
 
 #[test]
@@ -250,12 +253,19 @@ fn generate_tg_nonce_cryptographic_uniqueness_and_entropy() {
             total_set_bits += byte.count_ones() as usize;
         }
 
-        assert!(nonces.insert(nonce), "generate_tg_nonce emitted a duplicate nonce! RNG is stuck.");
+        assert!(
+            nonces.insert(nonce),
+            "generate_tg_nonce emitted a duplicate nonce! RNG is stuck."
+        );
     }
 
     let total_bits = iterations * HANDSHAKE_LEN * 8;
     let ratio = (total_set_bits as f64) / (total_bits as f64);
-    assert!(ratio > 0.48 && ratio < 0.52, "Nonce entropy is degraded. Set bit ratio: {}", ratio);
+    assert!(
+        ratio > 0.48 && ratio < 0.52,
+        "Nonce entropy is degraded. Set bit ratio: {}",
+        ratio
+    );
 }
 
 #[tokio::test]
@@ -267,10 +277,19 @@ async fn mtproto_multi_user_decryption_isolation() {
     config.general.modes.secure = true;
     config.access.ignore_time_skew = true;
 
-    config.access.users.insert("user_a".to_string(), "11111111111111111111111111111111".to_string());
-    config.access.users.insert("user_b".to_string(), "22222222222222222222222222222222".to_string());
+    config.access.users.insert(
+        "user_a".to_string(),
+        "11111111111111111111111111111111".to_string(),
+    );
+    config.access.users.insert(
+        "user_b".to_string(),
+        "22222222222222222222222222222222".to_string(),
+    );
     let good_secret_hex = "33333333333333333333333333333333";
-    config.access.users.insert("user_c".to_string(), good_secret_hex.to_string());
+    config
+        .access
+        .users
+        .insert("user_c".to_string(), good_secret_hex.to_string());
 
     let replay_checker = ReplayChecker::new(128, Duration::from_secs(60));
     let peer: SocketAddr = "192.0.2.104:12345".parse().unwrap();
@@ -291,9 +310,14 @@ async fn mtproto_multi_user_decryption_isolation() {
 
     match res {
         HandshakeResult::Success((_, _, success)) => {
-            assert_eq!(success.user, "user_c", "Decryption attempts on previous users must not corrupt the handshake buffer for the valid user");
+            assert_eq!(
+                success.user, "user_c",
+                "Decryption attempts on previous users must not corrupt the handshake buffer for the valid user"
+            );
         }
-        _ => panic!("Multi-user MTProto handshake failed. Decryption buffer might be mutating in place."),
+        _ => panic!(
+            "Multi-user MTProto handshake failed. Decryption buffer might be mutating in place."
+        ),
     }
 }
 
@@ -325,7 +349,9 @@ async fn invalid_secret_warning_lock_contention_and_bound() {
     }
 
     let warned = INVALID_SECRET_WARNED.get().unwrap();
-    let guard = warned.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let guard = warned
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
 
     assert_eq!(
         guard.len(),
@@ -342,7 +368,11 @@ async fn mtproto_strict_concurrent_replay_race_condition() {
     let secret_hex = "4A4A4A4A4A4A4A4A4A4A4A4A4A4A4A4A";
     let config = Arc::new(test_config_with_secret_hex(secret_hex));
     let replay_checker = Arc::new(ReplayChecker::new(4096, Duration::from_secs(60)));
-    let valid_handshake = Arc::new(make_valid_mtproto_handshake(secret_hex, ProtoTag::Secure, 1));
+    let valid_handshake = Arc::new(make_valid_mtproto_handshake(
+        secret_hex,
+        ProtoTag::Secure,
+        1,
+    ));
 
     let tasks = 100;
     let barrier = Arc::new(Barrier::new(tasks));
@@ -355,7 +385,10 @@ async fn mtproto_strict_concurrent_replay_race_condition() {
         let hs = valid_handshake.clone();
 
         handles.push(tokio::spawn(async move {
-            let peer = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(10, 0, 0, (i % 250) as u8)), 10000 + i as u16);
+            let peer = SocketAddr::new(
+                IpAddr::V4(Ipv4Addr::new(10, 0, 0, (i % 250) as u8)),
+                10000 + i as u16,
+            );
             b.wait().await;
             handle_mtproto_handshake(
                 &hs,
@@ -382,8 +415,15 @@ async fn mtproto_strict_concurrent_replay_race_condition() {
         }
     }
 
-    assert_eq!(successes, 1, "Replay cache race condition allowed multiple identical MTProto handshakes to succeed");
-    assert_eq!(failures, tasks - 1, "Replay cache failed to forcefully reject concurrent duplicates");
+    assert_eq!(
+        successes, 1,
+        "Replay cache race condition allowed multiple identical MTProto handshakes to succeed"
+    );
+    assert_eq!(
+        failures,
+        tasks - 1,
+        "Replay cache failed to forcefully reject concurrent duplicates"
+    );
 }
 
 #[tokio::test]
@@ -398,7 +438,8 @@ async fn tls_alpn_zero_length_protocol_handled_safely() {
     let rng = SecureRandom::new();
     let peer: SocketAddr = "192.0.2.107:12345".parse().unwrap();
 
-    let handshake = make_valid_tls_client_hello_with_sni_and_alpn(&secret, 0, "example.com", &[b""]);
+    let handshake =
+        make_valid_tls_client_hello_with_sni_and_alpn(&secret, 0, "example.com", &[b""]);
 
     let res = handle_tls_handshake(
         &handshake,
@@ -412,7 +453,10 @@ async fn tls_alpn_zero_length_protocol_handled_safely() {
     )
     .await;
 
-    assert!(matches!(res, HandshakeResult::BadClient { .. }), "0-length ALPN must be safely rejected without panicking");
+    assert!(
+        matches!(res, HandshakeResult::BadClient { .. }),
+        "0-length ALPN must be safely rejected without panicking"
+    );
 }
 
 #[tokio::test]
@@ -427,7 +471,8 @@ async fn tls_sni_massive_hostname_does_not_panic() {
     let peer: SocketAddr = "192.0.2.108:12345".parse().unwrap();
 
     let massive_hostname = String::from_utf8(vec![b'a'; 65000]).unwrap();
-    let handshake = make_valid_tls_client_hello_with_sni_and_alpn(&secret, 0, &massive_hostname, &[]);
+    let handshake =
+        make_valid_tls_client_hello_with_sni_and_alpn(&secret, 0, &massive_hostname, &[]);
 
     let res = handle_tls_handshake(
         &handshake,
@@ -441,7 +486,13 @@ async fn tls_sni_massive_hostname_does_not_panic() {
     )
     .await;
 
-    assert!(matches!(res, HandshakeResult::Success(_) | HandshakeResult::BadClient { .. }), "Massive SNI hostname must be processed or ignored without stack overflow or panic");
+    assert!(
+        matches!(
+            res,
+            HandshakeResult::Success(_) | HandshakeResult::BadClient { .. }
+        ),
+        "Massive SNI hostname must be processed or ignored without stack overflow or panic"
+    );
 }
 
 #[tokio::test]
@@ -455,7 +506,8 @@ async fn tls_progressive_truncation_fuzzing_no_panics() {
     let rng = SecureRandom::new();
     let peer: SocketAddr = "192.0.2.109:12345".parse().unwrap();
 
-    let valid_handshake = make_valid_tls_client_hello_with_sni_and_alpn(&secret, 0, "example.com", &[b"h2"]);
+    let valid_handshake =
+        make_valid_tls_client_hello_with_sni_and_alpn(&secret, 0, "example.com", &[b"h2"]);
     let full_len = valid_handshake.len();
 
     // Truncated corpus only: full_len is a valid baseline and should not be
@@ -473,7 +525,11 @@ async fn tls_progressive_truncation_fuzzing_no_panics() {
             None,
         )
         .await;
-        assert!(matches!(res, HandshakeResult::BadClient { .. }), "Truncated TLS handshake at len {} must fail safely without panicking", i);
+        assert!(
+            matches!(res, HandshakeResult::BadClient { .. }),
+            "Truncated TLS handshake at len {} must fail safely without panicking",
+            i
+        );
     }
 }
 
@@ -504,7 +560,10 @@ async fn mtproto_pure_entropy_fuzzing_no_panics() {
         )
         .await;
 
-        assert!(matches!(res, HandshakeResult::BadClient { .. }), "Pure entropy MTProto payload must fail closed and never panic");
+        assert!(
+            matches!(res, HandshakeResult::BadClient { .. }),
+            "Pure entropy MTProto payload must fail closed and never panic"
+        );
     }
 }
 
@@ -517,10 +576,16 @@ fn decode_user_secret_odd_length_hex_rejection() {
 
     let mut config = ProxyConfig::default();
     config.access.users.clear();
-    config.access.users.insert("odd_user".to_string(), "1234567890123456789012345678901".to_string());
+    config.access.users.insert(
+        "odd_user".to_string(),
+        "1234567890123456789012345678901".to_string(),
+    );
 
     let decoded = decode_user_secrets(&config, None);
-    assert!(decoded.is_empty(), "Odd-length hex string must be gracefully rejected by hex::decode without unwrapping");
+    assert!(
+        decoded.is_empty(),
+        "Odd-length hex string must be gracefully rejected by hex::decode without unwrapping"
+    );
 }
 
 #[test]
@@ -552,7 +617,10 @@ fn saturation_grace_pre_existing_high_fail_streak_immediate_throttle() {
     }
 
     let is_throttled = auth_probe_should_apply_preauth_throttle(peer_ip, now);
-    assert!(is_throttled, "A peer with a pre-existing high fail streak must be immediately throttled when saturation begins, receiving no unearned grace period");
+    assert!(
+        is_throttled,
+        "A peer with a pre-existing high fail streak must be immediately throttled when saturation begins, receiving no unearned grace period"
+    );
 }
 
 #[test]
@@ -586,7 +654,11 @@ fn mtproto_classic_tags_rejected_when_only_secure_mode_enabled() {
     config.general.modes.tls = false;
 
     assert!(!mode_enabled_for_proto(&config, ProtoTag::Abridged, false));
-    assert!(!mode_enabled_for_proto(&config, ProtoTag::Intermediate, false));
+    assert!(!mode_enabled_for_proto(
+        &config,
+        ProtoTag::Intermediate,
+        false
+    ));
 }
 
 #[test]

@@ -265,8 +265,8 @@ mask_relay_max_bytes = 67108865
 "#,
     );
 
-    let err = ProxyConfig::load(&path)
-        .expect_err("mask_relay_max_bytes above hard cap must be rejected");
+    let err =
+        ProxyConfig::load(&path).expect_err("mask_relay_max_bytes above hard cap must be rejected");
     let msg = err.to_string();
     assert!(
         msg.contains("censorship.mask_relay_max_bytes must be <= 67108864"),

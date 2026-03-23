@@ -88,6 +88,9 @@ fn light_fuzz_offset_always_stays_inside_state_len() {
         let now = base + Duration::from_nanos(seed & 0x0fff);
         let start = auth_probe_scan_start_offset(ip, now, state_len, scan_limit);
 
-        assert!(start < state_len, "scan offset must stay inside state length");
+        assert!(
+            start < state_len,
+            "scan offset must stay inside state length"
+        );
     }
 }

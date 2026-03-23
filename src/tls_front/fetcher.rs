@@ -812,8 +812,8 @@ mod tests {
     #[test]
     fn test_encode_tls13_certificate_message_single_cert() {
         let cert = vec![0x30, 0x03, 0x02, 0x01, 0x01];
-        let message = encode_tls13_certificate_message(std::slice::from_ref(&cert))
-            .expect("message");
+        let message =
+            encode_tls13_certificate_message(std::slice::from_ref(&cert)).expect("message");
 
         assert_eq!(message[0], 0x0b);
         assert_eq!(read_u24(&message[1..4]), message.len() - 4);

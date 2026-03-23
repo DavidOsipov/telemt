@@ -245,7 +245,10 @@ async fn blackhat_integration_empty_initial_data_path_is_byte_exact_and_eof_clea
     assert_eq!(head[0], 0x16);
     read_and_discard_tls_record_body(&mut client_side, head).await;
 
-    client_side.write_all(&invalid_mtproto_record).await.unwrap();
+    client_side
+        .write_all(&invalid_mtproto_record)
+        .await
+        .unwrap();
     client_side.write_all(&trailing_record).await.unwrap();
     client_side.shutdown().await.unwrap();
 

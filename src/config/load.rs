@@ -444,8 +444,7 @@ impl ProxyConfig {
 
         if !(5..=50).contains(&config.censorship.mask_classifier_prefetch_timeout_ms) {
             return Err(ProxyError::Config(
-                "censorship.mask_classifier_prefetch_timeout_ms must be within [5, 50]"
-                    .to_string(),
+                "censorship.mask_classifier_prefetch_timeout_ms must be within [5, 50]".to_string(),
             ));
         }
 
@@ -558,7 +557,9 @@ impl ProxyConfig {
             ));
         }
 
-        if !(4096..=16 * 1024 * 1024).contains(&config.general.me_d2c_frame_buf_shrink_threshold_bytes) {
+        if !(4096..=16 * 1024 * 1024)
+            .contains(&config.general.me_d2c_frame_buf_shrink_threshold_bytes)
+        {
             return Err(ProxyError::Config(
                 "general.me_d2c_frame_buf_shrink_threshold_bytes must be within [4096, 16777216]"
                     .to_string(),

@@ -37,7 +37,10 @@ async fn tdd_non_local_port_short_circuit_does_not_enumerate_interfaces() {
     let local_addr: SocketAddr = "0.0.0.0:443".parse().expect("valid local addr");
     let is_local = is_mask_target_local_listener_async("127.0.0.1", 8443, local_addr, None).await;
 
-    assert!(!is_local, "different port must not be treated as local listener");
+    assert!(
+        !is_local,
+        "different port must not be treated as local listener"
+    );
     assert_eq!(
         local_interface_enumerations_for_tests(),
         0,

@@ -954,7 +954,8 @@ impl Default for GeneralConfig {
             me_d2c_flush_batch_max_delay_us: default_me_d2c_flush_batch_max_delay_us(),
             me_d2c_ack_flush_immediate: default_me_d2c_ack_flush_immediate(),
             me_quota_soft_overshoot_bytes: default_me_quota_soft_overshoot_bytes(),
-            me_d2c_frame_buf_shrink_threshold_bytes: default_me_d2c_frame_buf_shrink_threshold_bytes(),
+            me_d2c_frame_buf_shrink_threshold_bytes:
+                default_me_d2c_frame_buf_shrink_threshold_bytes(),
             direct_relay_copy_buf_c2s_bytes: default_direct_relay_copy_buf_c2s_bytes(),
             direct_relay_copy_buf_s2c_bytes: default_direct_relay_copy_buf_s2c_bytes(),
             me_warmup_stagger_enabled: default_true(),

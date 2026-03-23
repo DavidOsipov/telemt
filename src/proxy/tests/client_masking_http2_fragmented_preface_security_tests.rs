@@ -100,14 +100,7 @@ async fn run_http2_fragment_case(split_at: usize, delay_ms: u64, peer: SocketAdd
 
 #[tokio::test]
 async fn http2_preface_fragmentation_matrix_is_classified_and_forwarded() {
-    let cases = [
-        (2usize, 0u64),
-        (3, 0),
-        (4, 0),
-        (2, 7),
-        (3, 7),
-        (8, 1),
-    ];
+    let cases = [(2usize, 0u64), (3, 0), (4, 0), (2, 7), (3, 7), (8, 1)];
 
     for (i, (split_at, delay_ms)) in cases.into_iter().enumerate() {
         let peer: SocketAddr = format!("198.51.100.{}:58{}", 140 + i, 100 + i)

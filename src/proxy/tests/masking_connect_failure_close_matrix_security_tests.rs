@@ -52,7 +52,10 @@ async fn run_connect_failure_case(
         .await
         .unwrap()
         .unwrap();
-    assert_eq!(n, 0, "connect-failure path must close client-visible writer");
+    assert_eq!(
+        n, 0,
+        "connect-failure path must close client-visible writer"
+    );
 
     started.elapsed()
 }
@@ -67,13 +70,9 @@ async fn connect_failure_refusal_close_behavior_matrix() {
         let peer: SocketAddr = format!("203.0.113.210:{}", 54100 + idx as u16)
             .parse()
             .unwrap();
-        let elapsed = run_connect_failure_case(
-            "127.0.0.1",
-            unused_port,
-            timing_normalization_enabled,
-            peer,
-        )
-        .await;
+        let elapsed =
+            run_connect_failure_case("127.0.0.1", unused_port, timing_normalization_enabled, peer)
+                .await;
 
         if timing_normalization_enabled {
             assert!(

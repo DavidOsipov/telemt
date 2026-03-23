@@ -56,8 +56,8 @@ use crate::stats::{Stats, UserStats};
 use crate::stream::BufferPool;
 use std::io;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt, ReadBuf, copy_bidirectional_with_sizes};
@@ -272,12 +272,10 @@ const QUOTA_ADAPTIVE_INTERVAL_MAX_BYTES: u64 = 64 * 1024;
 
 #[inline]
 fn quota_adaptive_interval_bytes(remaining_before: u64) -> u64 {
-    remaining_before
-        .saturating_div(2)
-        .clamp(
-            QUOTA_ADAPTIVE_INTERVAL_MIN_BYTES,
-            QUOTA_ADAPTIVE_INTERVAL_MAX_BYTES,
-        )
+    remaining_before.saturating_div(2).clamp(
+        QUOTA_ADAPTIVE_INTERVAL_MIN_BYTES,
+        QUOTA_ADAPTIVE_INTERVAL_MAX_BYTES,
+    )
 }
 
 #[inline]
