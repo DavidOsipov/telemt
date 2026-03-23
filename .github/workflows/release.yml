@@ -207,6 +207,58 @@ jobs:
             dist/${{ matrix.asset }}.sha256
 
 # ==========================
+# OpenBSD
+# ==========================
+  build-openbsd:
+    name: OpenBSD ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            asset: telemt-x86_64-openbsd
+            rustflags: -C target-cpu=x86-64-v2 -C opt-level=3
+          - arch: aarch64
+            asset: telemt-aarch64-openbsd
+            rustflags: -C target-cpu=cortex-a53 -C target-feature=+aes,+pmull,+sha2,+sha1,+crc -C opt-level=3
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in OpenBSD VM
+        uses: vmactions/openbsd-vm@v1
+        with:
+          release: "7.8"
+          arch: ${{ matrix.arch }}
+          usesh: true
+          sync: sshfs
+          envs: RUSTFLAGS CARGO_TERM_COLOR
+          prepare: |
+            pkg_add rust
+          run: |
+            set -e
+            cargo build --release --locked --verbose
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+
+      - name: Package
+        run: |
+          mkdir -p dist
+          cp target/release/${{ env.BINARY_NAME }} dist/${{ env.BINARY_NAME }}-${{ matrix.arch }}-unknown-openbsd
+          cd dist
+          tar -czf ${{ matrix.asset }}.tar.gz ${{ env.BINARY_NAME }}-${{ matrix.arch }}-unknown-openbsd
+          sha256sum ${{ matrix.asset }}.tar.gz > ${{ matrix.asset }}.sha256
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            dist/${{ matrix.asset }}.tar.gz
+            dist/${{ matrix.asset }}.sha256
+
+# ==========================
 # Docker
 # ==========================
   docker:
@@ -261,7 +313,7 @@ jobs:
   release:
     name: Release
     runs-on: ubuntu-latest
-    needs: [build-gnu, build-musl]
+    needs: [build-gnu, build-musl, build-openbsd]
 
     permissions:
       contents: write

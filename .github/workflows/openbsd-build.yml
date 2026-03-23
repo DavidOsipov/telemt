@@ -1,0 +1,69 @@
+name: Build telemt for OpenBSD
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openbsd-build-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: OpenBSD ${{ matrix.arch }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            artifact: telemt-openbsd-x86_64
+            rustflags: -C target-cpu=x86-64-v2 -C opt-level=3
+          - arch: aarch64
+            artifact: telemt-openbsd-aarch64
+            rustflags: -C target-cpu=cortex-a53 -C target-feature=+aes,+pmull,+sha2,+sha1,+crc -C opt-level=3
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+          clean: true
+          submodules: false
+
+      - name: Compile in OpenBSD VM
+        uses: vmactions/openbsd-vm@3fafb45f2e2e696249c583835939323fe1c3448c # v1
+        with:
+          release: "7.8"
+          arch: ${{ matrix.arch }}
+          usesh: true
+          sync: sshfs
+          envs: RUSTFLAGS CARGO_TERM_COLOR
+          prepare: |
+            pkg_add rust
+          run: |
+            set -e
+            cargo build --release --locked --verbose
+        env:
+          RUSTFLAGS: ${{ matrix.rustflags }}
+
+      - name: Verify artifact exists
+        run: test -f target/release/telemt
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: target/release/telemt
+          if-no-files-found: error
+          retention-days: 7
