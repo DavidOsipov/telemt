@@ -239,6 +239,15 @@ jobs:
             pkg_add rust
           run: |
             set -e
+            RUSTC_VERSION=$(rustc --version | awk '{print $2}')
+            RUSTC_MAJOR=$(echo "$RUSTC_VERSION" | cut -d. -f1)
+            RUSTC_MINOR=$(echo "$RUSTC_VERSION" | cut -d. -f2)
+            REQUIRED_MAJOR=1
+            REQUIRED_MINOR=85
+            if [ "$RUSTC_MAJOR" -lt "$REQUIRED_MAJOR" ] || { [ "$RUSTC_MAJOR" -eq "$REQUIRED_MAJOR" ] && [ "$RUSTC_MINOR" -lt "$REQUIRED_MINOR" ]; }; then
+              echo "rustc ${REQUIRED_MAJOR}.${REQUIRED_MINOR}.0 or newer is required for this project (found ${RUSTC_VERSION})."
+              exit 1
+            fi
             cargo build --release --locked --verbose
         env:
           RUSTFLAGS: ${{ matrix.rustflags }}
