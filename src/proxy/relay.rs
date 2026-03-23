@@ -293,6 +293,8 @@ const QUOTA_CONTENTION_RETRY_MAX_INTERVAL: Duration = Duration::from_millis(64);
 #[cfg(test)]
 static QUOTA_RETRY_SLEEP_ALLOCS: AtomicU64 = AtomicU64::new(0);
 #[cfg(test)]
+static QUOTA_RETRY_SLEEP_ALLOCS_BY_USER: OnceLock<DashMap<String, u64>> = OnceLock::new();
+#[cfg(test)]
 static QUOTA_USER_LOCK_EVICTOR_SPAWN_COUNT: AtomicU64 = AtomicU64::new(0);
 
 #[cfg(test)]
@@ -301,8 +303,20 @@ pub(crate) fn reset_quota_retry_sleep_allocs_for_tests() {
 }
 
 #[cfg(test)]
+pub(crate) fn reset_quota_retry_sleep_allocs_for_user_for_tests(user: &str) {
+    let map = QUOTA_RETRY_SLEEP_ALLOCS_BY_USER.get_or_init(DashMap::new);
+    map.remove(user);
+}
+
+#[cfg(test)]
 pub(crate) fn quota_retry_sleep_allocs_for_tests() -> u64 {
     QUOTA_RETRY_SLEEP_ALLOCS.load(Ordering::Relaxed)
+}
+
+#[cfg(test)]
+pub(crate) fn quota_retry_sleep_allocs_for_user_for_tests(user: &str) -> u64 {
+    let map = QUOTA_RETRY_SLEEP_ALLOCS_BY_USER.get_or_init(DashMap::new);
+    map.get(user).map(|v| *v.value()).unwrap_or(0)
 }
 
 #[inline]
@@ -329,12 +343,22 @@ fn poll_quota_retry_sleep(
     sleep_slot: &mut Option<Pin<Box<Sleep>>>,
     wake_scheduled: &mut bool,
     retry_attempt: &mut u8,
+    user: &str,
     cx: &mut Context<'_>,
 ) {
+    #[cfg(not(test))]
+    let _ = user;
+
     if !*wake_scheduled {
         *wake_scheduled = true;
         #[cfg(test)]
-        QUOTA_RETRY_SLEEP_ALLOCS.fetch_add(1, Ordering::Relaxed);
+        {
+            QUOTA_RETRY_SLEEP_ALLOCS.fetch_add(1, Ordering::Relaxed);
+            let map = QUOTA_RETRY_SLEEP_ALLOCS_BY_USER.get_or_init(DashMap::new);
+            map.entry(user.to_string())
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
+        }
         *sleep_slot = Some(Box::pin(tokio::time::sleep(quota_contention_retry_delay(
             *retry_attempt,
         ))));
@@ -465,6 +489,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for StatsIo<S> {
                         &mut this.quota_read_retry_sleep,
                         &mut this.quota_read_wake_scheduled,
                         &mut this.quota_read_retry_attempt,
+                        &this.user,
                         cx,
                     );
                     return Poll::Pending;
@@ -482,6 +507,7 @@ impl<S: AsyncRead + Unpin> AsyncRead for StatsIo<S> {
                         &mut this.quota_read_retry_sleep,
                         &mut this.quota_read_wake_scheduled,
                         &mut this.quota_read_retry_attempt,
+                        &this.user,
                         cx,
                     );
                     return Poll::Pending;
@@ -570,6 +596,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StatsIo<S> {
                         &mut this.quota_write_retry_sleep,
                         &mut this.quota_write_wake_scheduled,
                         &mut this.quota_write_retry_attempt,
+                        &this.user,
                         cx,
                     );
                     return Poll::Pending;
@@ -587,6 +614,7 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for StatsIo<S> {
                         &mut this.quota_write_retry_sleep,
                         &mut this.quota_write_wake_scheduled,
                         &mut this.quota_write_retry_attempt,
+                        &this.user,
                         cx,
                     );
                     return Poll::Pending;
