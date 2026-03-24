@@ -293,9 +293,7 @@ impl MePool {
                 WriterContour::Draining => "draining",
             };
 
-            if !draining
-                && let Some(dc_idx) = dc
-            {
+            if !draining && let Some(dc_idx) = dc {
                 *live_writers_by_dc_endpoint
                     .entry((dc_idx, endpoint))
                     .or_insert(0) += 1;

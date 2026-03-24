@@ -957,6 +957,89 @@ async fn stress_tls_sni_preferred_user_hint_scales_to_large_user_set() {
 }
 
 #[tokio::test]
+async fn tls_unknown_sni_drop_policy_returns_hard_error() {
+    let secret = [0x48u8; 16];
+    let mut config = test_config_with_secret_hex("48484848484848484848484848484848");
+    config.censorship.unknown_sni_action = UnknownSniAction::Drop;
+
+    let replay_checker = ReplayChecker::new(128, Duration::from_secs(60));
+    let rng = SecureRandom::new();
+    let peer: SocketAddr = "198.51.100.190:44326".parse().unwrap();
+    let handshake =
+        make_valid_tls_client_hello_with_sni_and_alpn(&secret, 0, "unknown.example", &[b"h2"]);
+
+    let result = handle_tls_handshake(
+        &handshake,
+        tokio::io::empty(),
+        tokio::io::sink(),
+        peer,
+        &config,
+        &replay_checker,
+        &rng,
+        None,
+    )
+    .await;
+
+    assert!(matches!(
+        result,
+        HandshakeResult::Error(ProxyError::UnknownTlsSni)
+    ));
+}
+
+#[tokio::test]
+async fn tls_unknown_sni_mask_policy_falls_back_to_bad_client() {
+    let secret = [0x49u8; 16];
+    let mut config = test_config_with_secret_hex("49494949494949494949494949494949");
+    config.censorship.unknown_sni_action = UnknownSniAction::Mask;
+
+    let replay_checker = ReplayChecker::new(128, Duration::from_secs(60));
+    let rng = SecureRandom::new();
+    let peer: SocketAddr = "198.51.100.191:44326".parse().unwrap();
+    let handshake =
+        make_valid_tls_client_hello_with_sni_and_alpn(&secret, 0, "unknown.example", &[b"h2"]);
+
+    let result = handle_tls_handshake(
+        &handshake,
+        tokio::io::empty(),
+        tokio::io::sink(),
+        peer,
+        &config,
+        &replay_checker,
+        &rng,
+        None,
+    )
+    .await;
+
+    assert!(matches!(result, HandshakeResult::BadClient { .. }));
+}
+
+#[tokio::test]
+async fn tls_missing_sni_keeps_legacy_auth_path() {
+    let secret = [0x4Au8; 16];
+    let mut config = test_config_with_secret_hex("4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a4a");
+    config.censorship.unknown_sni_action = UnknownSniAction::Drop;
+
+    let replay_checker = ReplayChecker::new(128, Duration::from_secs(60));
+    let rng = SecureRandom::new();
+    let peer: SocketAddr = "198.51.100.192:44326".parse().unwrap();
+    let handshake = make_valid_tls_handshake(&secret, 0);
+
+    let result = handle_tls_handshake(
+        &handshake,
+        tokio::io::empty(),
+        tokio::io::sink(),
+        peer,
+        &config,
+        &replay_checker,
+        &rng,
+        None,
+    )
+    .await;
+
+    assert!(matches!(result, HandshakeResult::Success(_)));
+}
+
+#[tokio::test]
 async fn alpn_enforce_rejects_unsupported_client_alpn() {
     let secret = [0x33u8; 16];
     let mut config = test_config_with_secret_hex("33333333333333333333333333333333");

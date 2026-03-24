@@ -79,7 +79,10 @@ async fn io_error_terminates_cleanly() {
         }
     }
 
-    tokio::time::timeout(MASK_RELAY_TIMEOUT, consume_client_data(ErrReader, usize::MAX))
-        .await
-        .expect("consume_client_data did not return on I/O error");
+    tokio::time::timeout(
+        MASK_RELAY_TIMEOUT,
+        consume_client_data(ErrReader, usize::MAX),
+    )
+    .await
+    .expect("consume_client_data did not return on I/O error");
 }

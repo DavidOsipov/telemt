@@ -210,7 +210,9 @@ fn should_prefetch_mask_classifier_window(initial_data: &[u8]) -> bool {
         return false;
     }
 
-    initial_data.iter().all(|b| b.is_ascii_alphabetic() || *b == b' ')
+    initial_data
+        .iter()
+        .all(|b| b.is_ascii_alphabetic() || *b == b' ')
 }
 
 #[cfg(test)]
@@ -218,16 +220,19 @@ async fn extend_masking_initial_window<R>(reader: &mut R, initial_data: &mut Vec
 where
     R: AsyncRead + Unpin,
 {
-    extend_masking_initial_window_with_timeout(reader, initial_data, MASK_CLASSIFIER_PREFETCH_TIMEOUT)
-        .await;
+    extend_masking_initial_window_with_timeout(
+        reader,
+        initial_data,
+        MASK_CLASSIFIER_PREFETCH_TIMEOUT,
+    )
+    .await;
 }
 
 async fn extend_masking_initial_window_with_timeout<R>(
     reader: &mut R,
     initial_data: &mut Vec<u8>,
     prefetch_timeout: Duration,
-)
-where
+) where
     R: AsyncRead + Unpin,
 {
     if !should_prefetch_mask_classifier_window(initial_data) {
@@ -312,13 +317,20 @@ fn record_handshake_failure_class(
     record_beobachten_class(beobachten, config, peer_ip, class);
 }
 
+#[inline]
+fn increment_bad_on_unknown_tls_sni(stats: &Stats, error: &ProxyError) {
+    if matches!(error, ProxyError::UnknownTlsSni) {
+        stats.increment_connects_bad();
+    }
+}
+
 fn is_trusted_proxy_source(peer_ip: IpAddr, trusted: &[IpNetwork]) -> bool {
     if trusted.is_empty() {
         static EMPTY_PROXY_TRUST_WARNED: OnceLock<AtomicBool> = OnceLock::new();
         let warned = EMPTY_PROXY_TRUST_WARNED.get_or_init(|| AtomicBool::new(false));
         if !warned.swap(true, Ordering::Relaxed) {
             warn!(
-                "PROXY protocol enabled but server.proxy_protocol_trusted_cidrs is empty; rejecting all PROXY headers by default"
+                "PROXY protocol enabled but server.proxy_protocol_trusted_cidrs is empty; rejecting all PROXY headers"
             );
         }
         return false;
@@ -503,7 +515,10 @@ where
                         beobachten.clone(),
                     ));
                 }
-                HandshakeResult::Error(e) => return Err(e),
+                HandshakeResult::Error(e) => {
+                    increment_bad_on_unknown_tls_sni(stats.as_ref(), &e);
+                    return Err(e);
+                }
             };
 
             debug!(peer = %peer, "Reading MTProto handshake through TLS");
@@ -954,7 +969,10 @@ impl RunningClientHandler {
                     self.beobachten.clone(),
                 ));
             }
-            HandshakeResult::Error(e) => return Err(e),
+            HandshakeResult::Error(e) => {
+                increment_bad_on_unknown_tls_sni(stats.as_ref(), &e);
+                return Err(e);
+            }
         };
 
         debug!(peer = %peer, "Reading MTProto handshake through TLS");
@@ -1223,7 +1241,7 @@ impl RunningClientHandler {
         }
 
         if let Some(quota) = config.access.user_data_quota.get(user)
-            && stats.get_user_total_octets(user) >= *quota
+            && stats.get_user_quota_used(user) >= *quota
         {
             return Err(ProxyError::DataQuotaExceeded {
                 user: user.to_string(),
@@ -1282,7 +1300,7 @@ impl RunningClientHandler {
         }
 
         if let Some(quota) = config.access.user_data_quota.get(user)
-            && stats.get_user_total_octets(user) >= *quota
+            && stats.get_user_quota_used(user) >= *quota
         {
             return Err(ProxyError::DataQuotaExceeded {
                 user: user.to_string(),

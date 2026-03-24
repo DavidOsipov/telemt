@@ -1,5 +1,5 @@
 use super::*;
-use crate::crypto::{sha256, sha256_hmac, AesCtr, SecureRandom};
+use crate::crypto::{AesCtr, SecureRandom, sha256, sha256_hmac};
 use crate::protocol::constants::{ProtoTag, TLS_RECORD_HANDSHAKE, TLS_VERSION};
 use std::net::SocketAddr;
 use std::time::{Duration, Instant};
@@ -169,10 +169,10 @@ async fn mtproto_user_scan_timing_manual_benchmark() {
         );
     }
 
-    config.access.users.insert(
-        preferred_user.to_string(),
-        target_secret_hex.to_string(),
-    );
+    config
+        .access
+        .users
+        .insert(preferred_user.to_string(), target_secret_hex.to_string());
 
     let replay_checker_preferred = ReplayChecker::new(65_536, Duration::from_secs(60));
     let replay_checker_full_scan = ReplayChecker::new(65_536, Duration::from_secs(60));

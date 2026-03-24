@@ -1233,10 +1233,7 @@ async fn render_metrics(stats: &Stats, config: &ProxyConfig, ip_tracker: &UserIp
         out,
         "# HELP telemt_me_d2c_batch_bytes_bucket_total DC->Client batch byte size buckets"
     );
-    let _ = writeln!(
-        out,
-        "# TYPE telemt_me_d2c_batch_bytes_bucket_total counter"
-    );
+    let _ = writeln!(out, "# TYPE telemt_me_d2c_batch_bytes_bucket_total counter");
     let _ = writeln!(
         out,
         "telemt_me_d2c_batch_bytes_bucket_total{{bucket=\"0_1k\"}} {}",

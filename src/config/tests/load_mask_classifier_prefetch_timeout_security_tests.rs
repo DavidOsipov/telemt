@@ -8,8 +8,9 @@ fn write_temp_config(contents: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system time must be after unix epoch")
         .as_nanos();
-    let path = std::env::temp_dir()
-        .join(format!("telemt-load-mask-prefetch-timeout-security-{nonce}.toml"));
+    let path = std::env::temp_dir().join(format!(
+        "telemt-load-mask-prefetch-timeout-security-{nonce}.toml"
+    ));
     fs::write(&path, contents).expect("temp config write must succeed");
     path
 }
@@ -67,8 +68,8 @@ mask_classifier_prefetch_timeout_ms = 20
 "#,
     );
 
-    let cfg = ProxyConfig::load(&path)
-        .expect("prefetch timeout within security bounds must be accepted");
+    let cfg =
+        ProxyConfig::load(&path).expect("prefetch timeout within security bounds must be accepted");
     assert_eq!(cfg.censorship.mask_classifier_prefetch_timeout_ms, 20);
 
     remove_temp_config(&path);

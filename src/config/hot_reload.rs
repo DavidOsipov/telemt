@@ -228,7 +228,9 @@ impl HotFields {
             me_d2c_flush_batch_max_delay_us: cfg.general.me_d2c_flush_batch_max_delay_us,
             me_d2c_ack_flush_immediate: cfg.general.me_d2c_ack_flush_immediate,
             me_quota_soft_overshoot_bytes: cfg.general.me_quota_soft_overshoot_bytes,
-            me_d2c_frame_buf_shrink_threshold_bytes: cfg.general.me_d2c_frame_buf_shrink_threshold_bytes,
+            me_d2c_frame_buf_shrink_threshold_bytes: cfg
+                .general
+                .me_d2c_frame_buf_shrink_threshold_bytes,
             direct_relay_copy_buf_c2s_bytes: cfg.general.direct_relay_copy_buf_c2s_bytes,
             direct_relay_copy_buf_s2c_bytes: cfg.general.direct_relay_copy_buf_s2c_bytes,
             me_health_interval_ms_unhealthy: cfg.general.me_health_interval_ms_unhealthy,

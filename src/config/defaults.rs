@@ -71,6 +71,22 @@ pub(crate) fn default_tls_fetch_scope() -> String {
     String::new()
 }
 
+pub(crate) fn default_tls_fetch_attempt_timeout_ms() -> u64 {
+    5_000
+}
+
+pub(crate) fn default_tls_fetch_total_budget_ms() -> u64 {
+    15_000
+}
+
+pub(crate) fn default_tls_fetch_strict_route() -> bool {
+    true
+}
+
+pub(crate) fn default_tls_fetch_profile_cache_ttl_secs() -> u64 {
+    600
+}
+
 pub(crate) fn default_mask_port() -> u16 {
     443
 }
@@ -183,6 +199,10 @@ pub(crate) fn default_api_runtime_edge_events_capacity() -> usize {
 
 pub(crate) fn default_proxy_protocol_header_timeout_ms() -> u64 {
     500
+}
+
+pub(crate) fn default_proxy_protocol_trusted_cidrs() -> Vec<IpNetwork> {
+    vec!["0.0.0.0/0".parse().unwrap(), "::/0".parse().unwrap()]
 }
 
 pub(crate) fn default_server_max_connections() -> u32 {

@@ -29,7 +29,10 @@ fn blackhat_registry_poison_recovers_with_fail_closed_reset_and_pressure_account
     let before = relay_pressure_event_seq();
     note_relay_pressure_event();
     let after = relay_pressure_event_seq();
-    assert!(after > before, "pressure accounting must still advance after poison");
+    assert!(
+        after > before,
+        "pressure accounting must still advance after poison"
+    );
 
     clear_relay_idle_pressure_state_for_testing();
 }

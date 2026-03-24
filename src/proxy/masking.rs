@@ -10,10 +10,10 @@ use rand::rngs::StdRng;
 use rand::{Rng, RngExt, SeedableRng};
 use std::net::{IpAddr, SocketAddr};
 use std::str;
-#[cfg(unix)]
-use std::sync::{Mutex, OnceLock};
 #[cfg(test)]
 use std::sync::atomic::{AtomicUsize, Ordering};
+#[cfg(unix)]
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant as StdInstant};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio::net::TcpStream;
@@ -60,7 +60,7 @@ where
     R: AsyncRead + Unpin,
     W: AsyncWrite + Unpin,
 {
-    let mut buf = [0u8; MASK_BUFFER_SIZE];
+    let mut buf = Box::new([0u8; MASK_BUFFER_SIZE]);
     let mut total = 0usize;
     let mut ended_by_eof = false;
 
@@ -107,15 +107,7 @@ where
 fn is_http_probe(data: &[u8]) -> bool {
     // RFC 7540 section 3.5: HTTP/2 client preface starts with "PRI ".
     const HTTP_METHODS: [&[u8]; 10] = [
-        b"GET ",
-        b"POST",
-        b"HEAD",
-        b"PUT ",
-        b"DELETE",
-        b"OPTIONS",
-        b"CONNECT",
-        b"TRACE",
-        b"PATCH",
+        b"GET ", b"POST", b"HEAD", b"PUT ", b"DELETE", b"OPTIONS", b"CONNECT", b"TRACE", b"PATCH",
         b"PRI ",
     ];
 
@@ -262,7 +254,11 @@ fn mask_outcome_target_budget(config: &ProxyConfig) -> Duration {
         let floor = config.censorship.mask_timing_normalization_floor_ms;
         let ceiling = config.censorship.mask_timing_normalization_ceiling_ms;
         if floor == 0 {
-            return MASK_TIMEOUT;
+            if ceiling == 0 {
+                return Duration::from_millis(0);
+            }
+            let mut rng = rand::rng();
+            return Duration::from_millis(rng.random_range(0..=ceiling));
         }
         if ceiling > floor {
             let mut rng = rand::rng();
@@ -324,7 +320,10 @@ fn parse_mask_host_ip_literal(host: &str) -> Option<IpAddr> {
 
 fn canonical_ip(ip: IpAddr) -> IpAddr {
     match ip {
-        IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4).unwrap_or(IpAddr::V6(v6)),
+        IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
         IpAddr::V4(v4) => IpAddr::V4(v4),
     }
 }
@@ -660,12 +659,20 @@ pub async fn handle_bad_client<R, W>(
             Ok(Err(e)) => {
                 wait_mask_connect_budget_if_needed(connect_started, config).await;
                 debug!(error = %e, "Failed to connect to mask unix socket");
-                consume_client_data_with_timeout_and_cap(reader, config.censorship.mask_relay_max_bytes).await;
+                consume_client_data_with_timeout_and_cap(
+                    reader,
+                    config.censorship.mask_relay_max_bytes,
+                )
+                .await;
                 wait_mask_outcome_budget(outcome_started, config).await;
             }
             Err(_) => {
                 debug!("Timeout connecting to mask unix socket");
-                consume_client_data_with_timeout_and_cap(reader, config.censorship.mask_relay_max_bytes).await;
+                consume_client_data_with_timeout_and_cap(
+                    reader,
+                    config.censorship.mask_relay_max_bytes,
+                )
+                .await;
                 wait_mask_outcome_budget(outcome_started, config).await;
             }
         }
@@ -694,7 +701,8 @@ pub async fn handle_bad_client<R, W>(
             local = %local_addr,
             "Mask target resolves to local listener; refusing self-referential masking fallback"
         );
-        consume_client_data_with_timeout_and_cap(reader, config.censorship.mask_relay_max_bytes).await;
+        consume_client_data_with_timeout_and_cap(reader, config.censorship.mask_relay_max_bytes)
+            .await;
         wait_mask_outcome_budget(outcome_started, config).await;
         return;
     }
@@ -754,12 +762,20 @@ pub async fn handle_bad_client<R, W>(
         Ok(Err(e)) => {
             wait_mask_connect_budget_if_needed(connect_started, config).await;
             debug!(error = %e, "Failed to connect to mask host");
-            consume_client_data_with_timeout_and_cap(reader, config.censorship.mask_relay_max_bytes).await;
+            consume_client_data_with_timeout_and_cap(
+                reader,
+                config.censorship.mask_relay_max_bytes,
+            )
+            .await;
             wait_mask_outcome_budget(outcome_started, config).await;
         }
         Err(_) => {
             debug!("Timeout connecting to mask host");
-            consume_client_data_with_timeout_and_cap(reader, config.censorship.mask_relay_max_bytes).await;
+            consume_client_data_with_timeout_and_cap(
+                reader,
+                config.censorship.mask_relay_max_bytes,
+            )
+            .await;
             wait_mask_outcome_budget(outcome_started, config).await;
         }
     }
@@ -838,7 +854,7 @@ async fn consume_client_data<R: AsyncRead + Unpin>(mut reader: R, byte_cap: usiz
     }
 
     // Keep drain path fail-closed under slow-loris stalls.
-    let mut buf = [0u8; MASK_BUFFER_SIZE];
+    let mut buf = Box::new([0u8; MASK_BUFFER_SIZE]);
     let mut total = 0usize;
 
     loop {

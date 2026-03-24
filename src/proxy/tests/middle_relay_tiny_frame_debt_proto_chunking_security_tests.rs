@@ -51,7 +51,9 @@ fn make_enabled_idle_policy() -> RelayClientIdlePolicy {
 fn append_tiny_frame(plaintext: &mut Vec<u8>, proto: ProtoTag) {
     match proto {
         ProtoTag::Abridged => plaintext.push(0x00),
-        ProtoTag::Intermediate | ProtoTag::Secure => plaintext.extend_from_slice(&0u32.to_le_bytes()),
+        ProtoTag::Intermediate | ProtoTag::Secure => {
+            plaintext.extend_from_slice(&0u32.to_le_bytes())
+        }
     }
 }
 
@@ -206,7 +208,11 @@ async fn intermediate_chunked_alternating_attack_closes_before_eof() {
     let mut plaintext = Vec::with_capacity(8 * 200);
     for n in 0..180u8 {
         append_tiny_frame(&mut plaintext, ProtoTag::Intermediate);
-        append_real_frame(&mut plaintext, ProtoTag::Intermediate, [n, n ^ 1, n ^ 2, n ^ 3]);
+        append_real_frame(
+            &mut plaintext,
+            ProtoTag::Intermediate,
+            [n, n ^ 1, n ^ 2, n ^ 3],
+        );
     }
     let encrypted = encrypt_for_reader(&plaintext);
 
@@ -240,7 +246,9 @@ async fn intermediate_chunked_alternating_attack_closes_before_eof() {
         }
     }
 
-    writer_task.await.expect("intermediate writer task must not panic");
+    writer_task
+        .await
+        .expect("intermediate writer task must not panic");
     assert!(closed, "intermediate alternating attack must fail closed");
 }
 
@@ -290,7 +298,9 @@ async fn secure_chunked_alternating_attack_closes_before_eof() {
         }
     }
 
-    writer_task.await.expect("secure writer task must not panic");
+    writer_task
+        .await
+        .expect("secure writer task must not panic");
     assert!(closed, "secure alternating attack must fail closed");
 }
 

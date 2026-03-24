@@ -238,10 +238,12 @@ pub struct Stats {
     me_inline_recovery_total: AtomicU64,
     ip_reservation_rollback_tcp_limit_total: AtomicU64,
     ip_reservation_rollback_quota_limit_total: AtomicU64,
+    quota_write_fail_bytes_total: AtomicU64,
+    quota_write_fail_events_total: AtomicU64,
     telemetry_core_enabled: AtomicBool,
     telemetry_user_enabled: AtomicBool,
     telemetry_me_level: AtomicU8,
-    user_stats: DashMap<String, UserStats>,
+    user_stats: DashMap<String, Arc<UserStats>>,
     user_stats_last_cleanup_epoch_secs: AtomicU64,
     start_time: parking_lot::RwLock<Option<Instant>>,
 }
@@ -254,7 +256,49 @@ pub struct UserStats {
     pub octets_to_client: AtomicU64,
     pub msgs_from_client: AtomicU64,
     pub msgs_to_client: AtomicU64,
+    /// Total bytes charged against per-user quota admission.
+    ///
+    /// This counter is the single source of truth for quota enforcement and
+    /// intentionally tracks attempted traffic, not guaranteed delivery.
+    pub quota_used: AtomicU64,
     pub last_seen_epoch_secs: AtomicU64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum QuotaReserveError {
+    LimitExceeded,
+    Contended,
+}
+
+impl UserStats {
+    #[inline]
+    pub fn quota_used(&self) -> u64 {
+        self.quota_used.load(Ordering::Relaxed)
+    }
+
+    /// Attempts one CAS reservation step against the quota counter.
+    ///
+    /// Callers control retry/yield policy. This primitive intentionally does
+    /// not block or sleep so both sync poll paths and async paths can wrap it
+    /// with their own contention strategy.
+    #[inline]
+    pub fn quota_try_reserve(&self, bytes: u64, limit: u64) -> Result<u64, QuotaReserveError> {
+        let current = self.quota_used.load(Ordering::Relaxed);
+        if bytes > limit.saturating_sub(current) {
+            return Err(QuotaReserveError::LimitExceeded);
+        }
+
+        let next = current.saturating_add(bytes);
+        match self.quota_used.compare_exchange_weak(
+            current,
+            next,
+            Ordering::Relaxed,
+            Ordering::Relaxed,
+        ) {
+            Ok(_) => Ok(next),
+            Err(_) => Err(QuotaReserveError::Contended),
+        }
+    }
 }
 
 impl Stats {
@@ -314,6 +358,74 @@ impl Stats {
         stats
             .last_seen_epoch_secs
             .store(Self::now_epoch_secs(), Ordering::Relaxed);
+    }
+
+    pub(crate) fn get_or_create_user_stats_handle(&self, user: &str) -> Arc<UserStats> {
+        self.maybe_cleanup_user_stats();
+        if let Some(existing) = self.user_stats.get(user) {
+            let handle = Arc::clone(existing.value());
+            Self::touch_user_stats(handle.as_ref());
+            return handle;
+        }
+
+        let entry = self.user_stats.entry(user.to_string()).or_default();
+        if entry.last_seen_epoch_secs.load(Ordering::Relaxed) == 0 {
+            Self::touch_user_stats(entry.value().as_ref());
+        }
+        Arc::clone(entry.value())
+    }
+
+    #[inline]
+    pub(crate) fn add_user_octets_from_handle(&self, user_stats: &UserStats, bytes: u64) {
+        if !self.telemetry_user_enabled() {
+            return;
+        }
+        Self::touch_user_stats(user_stats);
+        user_stats
+            .octets_from_client
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn add_user_octets_to_handle(&self, user_stats: &UserStats, bytes: u64) {
+        if !self.telemetry_user_enabled() {
+            return;
+        }
+        Self::touch_user_stats(user_stats);
+        user_stats
+            .octets_to_client
+            .fetch_add(bytes, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn increment_user_msgs_from_handle(&self, user_stats: &UserStats) {
+        if !self.telemetry_user_enabled() {
+            return;
+        }
+        Self::touch_user_stats(user_stats);
+        user_stats.msgs_from_client.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub(crate) fn increment_user_msgs_to_handle(&self, user_stats: &UserStats) {
+        if !self.telemetry_user_enabled() {
+            return;
+        }
+        Self::touch_user_stats(user_stats);
+        user_stats.msgs_to_client.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Charges already committed bytes in a post-I/O path.
+    ///
+    /// This helper is intentionally separate from `quota_try_reserve` to avoid
+    /// mixing reserve and post-charge on a single I/O event.
+    #[inline]
+    pub(crate) fn quota_charge_post_write(&self, user_stats: &UserStats, bytes: u64) -> u64 {
+        Self::touch_user_stats(user_stats);
+        user_stats
+            .quota_used
+            .fetch_add(bytes, Ordering::Relaxed)
+            .saturating_add(bytes)
     }
 
     fn maybe_cleanup_user_stats(&self) {
@@ -704,7 +816,8 @@ impl Stats {
     }
     pub fn increment_me_d2c_data_frames_total(&self) {
         if self.telemetry_me_allows_normal() {
-            self.me_d2c_data_frames_total.fetch_add(1, Ordering::Relaxed);
+            self.me_d2c_data_frames_total
+                .fetch_add(1, Ordering::Relaxed);
         }
     }
     pub fn increment_me_d2c_ack_frames_total(&self) {
@@ -1111,6 +1224,18 @@ impl Stats {
     pub fn increment_ip_reservation_rollback_quota_limit_total(&self) {
         if self.telemetry_core_enabled() {
             self.ip_reservation_rollback_quota_limit_total
+                .fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    pub fn add_quota_write_fail_bytes_total(&self, bytes: u64) {
+        if self.telemetry_core_enabled() {
+            self.quota_write_fail_bytes_total
+                .fetch_add(bytes, Ordering::Relaxed);
+        }
+    }
+    pub fn increment_quota_write_fail_events_total(&self) {
+        if self.telemetry_core_enabled() {
+            self.quota_write_fail_events_total
                 .fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -1588,7 +1713,8 @@ impl Stats {
         self.me_d2c_batch_bytes_bucket_1k_4k.load(Ordering::Relaxed)
     }
     pub fn get_me_d2c_batch_bytes_bucket_4k_16k(&self) -> u64 {
-        self.me_d2c_batch_bytes_bucket_4k_16k.load(Ordering::Relaxed)
+        self.me_d2c_batch_bytes_bucket_4k_16k
+            .load(Ordering::Relaxed)
     }
     pub fn get_me_d2c_batch_bytes_bucket_16k_64k(&self) -> u64 {
         self.me_d2c_batch_bytes_bucket_16k_64k
@@ -1764,19 +1890,19 @@ impl Stats {
         self.ip_reservation_rollback_quota_limit_total
             .load(Ordering::Relaxed)
     }
+    pub fn get_quota_write_fail_bytes_total(&self) -> u64 {
+        self.quota_write_fail_bytes_total.load(Ordering::Relaxed)
+    }
+    pub fn get_quota_write_fail_events_total(&self) -> u64 {
+        self.quota_write_fail_events_total.load(Ordering::Relaxed)
+    }
 
     pub fn increment_user_connects(&self, user: &str) {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.maybe_cleanup_user_stats();
-        if let Some(stats) = self.user_stats.get(user) {
-            Self::touch_user_stats(stats.value());
-            stats.connects.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        let stats = self.user_stats.entry(user.to_string()).or_default();
-        Self::touch_user_stats(stats.value());
+        let stats = self.get_or_create_user_stats_handle(user);
+        Self::touch_user_stats(stats.as_ref());
         stats.connects.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1784,14 +1910,8 @@ impl Stats {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.maybe_cleanup_user_stats();
-        if let Some(stats) = self.user_stats.get(user) {
-            Self::touch_user_stats(stats.value());
-            stats.curr_connects.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        let stats = self.user_stats.entry(user.to_string()).or_default();
-        Self::touch_user_stats(stats.value());
+        let stats = self.get_or_create_user_stats_handle(user);
+        Self::touch_user_stats(stats.as_ref());
         stats.curr_connects.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -1800,9 +1920,8 @@ impl Stats {
             return true;
         }
 
-        self.maybe_cleanup_user_stats();
-        let stats = self.user_stats.entry(user.to_string()).or_default();
-        Self::touch_user_stats(stats.value());
+        let stats = self.get_or_create_user_stats_handle(user);
+        Self::touch_user_stats(stats.as_ref());
 
         let counter = &stats.curr_connects;
         let mut current = counter.load(Ordering::Relaxed);
@@ -1827,7 +1946,7 @@ impl Stats {
     pub fn decrement_user_curr_connects(&self, user: &str) {
         self.maybe_cleanup_user_stats();
         if let Some(stats) = self.user_stats.get(user) {
-            Self::touch_user_stats(stats.value());
+            Self::touch_user_stats(stats.value().as_ref());
             let counter = &stats.curr_connects;
             let mut current = counter.load(Ordering::Relaxed);
             loop {
@@ -1858,86 +1977,32 @@ impl Stats {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.maybe_cleanup_user_stats();
-        if let Some(stats) = self.user_stats.get(user) {
-            Self::touch_user_stats(stats.value());
-            stats.octets_from_client.fetch_add(bytes, Ordering::Relaxed);
-            return;
-        }
-        let stats = self.user_stats.entry(user.to_string()).or_default();
-        Self::touch_user_stats(stats.value());
-        stats.octets_from_client.fetch_add(bytes, Ordering::Relaxed);
+        let stats = self.get_or_create_user_stats_handle(user);
+        self.add_user_octets_from_handle(stats.as_ref(), bytes);
     }
 
     pub fn add_user_octets_to(&self, user: &str, bytes: u64) {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.maybe_cleanup_user_stats();
-        if let Some(stats) = self.user_stats.get(user) {
-            Self::touch_user_stats(stats.value());
-            stats.octets_to_client.fetch_add(bytes, Ordering::Relaxed);
-            return;
-        }
-        let stats = self.user_stats.entry(user.to_string()).or_default();
-        Self::touch_user_stats(stats.value());
-        stats.octets_to_client.fetch_add(bytes, Ordering::Relaxed);
-    }
-
-    pub fn sub_user_octets_to(&self, user: &str, bytes: u64) {
-        if !self.telemetry_user_enabled() {
-            return;
-        }
-        self.maybe_cleanup_user_stats();
-        let Some(stats) = self.user_stats.get(user) else {
-            return;
-        };
-
-        Self::touch_user_stats(stats.value());
-        let counter = &stats.octets_to_client;
-        let mut current = counter.load(Ordering::Relaxed);
-        loop {
-            let next = current.saturating_sub(bytes);
-            match counter.compare_exchange_weak(
-                current,
-                next,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
-                Ok(_) => break,
-                Err(actual) => current = actual,
-            }
-        }
+        let stats = self.get_or_create_user_stats_handle(user);
+        self.add_user_octets_to_handle(stats.as_ref(), bytes);
     }
 
     pub fn increment_user_msgs_from(&self, user: &str) {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.maybe_cleanup_user_stats();
-        if let Some(stats) = self.user_stats.get(user) {
-            Self::touch_user_stats(stats.value());
-            stats.msgs_from_client.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        let stats = self.user_stats.entry(user.to_string()).or_default();
-        Self::touch_user_stats(stats.value());
-        stats.msgs_from_client.fetch_add(1, Ordering::Relaxed);
+        let stats = self.get_or_create_user_stats_handle(user);
+        self.increment_user_msgs_from_handle(stats.as_ref());
     }
 
     pub fn increment_user_msgs_to(&self, user: &str) {
         if !self.telemetry_user_enabled() {
             return;
         }
-        self.maybe_cleanup_user_stats();
-        if let Some(stats) = self.user_stats.get(user) {
-            Self::touch_user_stats(stats.value());
-            stats.msgs_to_client.fetch_add(1, Ordering::Relaxed);
-            return;
-        }
-        let stats = self.user_stats.entry(user.to_string()).or_default();
-        Self::touch_user_stats(stats.value());
-        stats.msgs_to_client.fetch_add(1, Ordering::Relaxed);
+        let stats = self.get_or_create_user_stats_handle(user);
+        self.increment_user_msgs_to_handle(stats.as_ref());
     }
 
     pub fn get_user_total_octets(&self, user: &str) -> u64 {
@@ -1947,6 +2012,13 @@ impl Stats {
                 s.octets_from_client.load(Ordering::Relaxed)
                     + s.octets_to_client.load(Ordering::Relaxed)
             })
+            .unwrap_or(0)
+    }
+
+    pub fn get_user_quota_used(&self, user: &str) -> u64 {
+        self.user_stats
+            .get(user)
+            .map(|s| s.quota_used.load(Ordering::Relaxed))
             .unwrap_or(0)
     }
 
@@ -2015,7 +2087,7 @@ impl Stats {
             .load(Ordering::Relaxed)
     }
 
-    pub fn iter_user_stats(&self) -> dashmap::iter::Iter<'_, String, UserStats> {
+    pub fn iter_user_stats(&self) -> dashmap::iter::Iter<'_, String, Arc<UserStats>> {
         self.user_stats.iter()
     }
 
@@ -2163,6 +2235,22 @@ impl ReplayChecker {
         found
     }
 
+    fn check_only_internal(
+        &self,
+        data: &[u8],
+        shards: &[Mutex<ReplayShard>],
+        window: Duration,
+    ) -> bool {
+        self.checks.fetch_add(1, Ordering::Relaxed);
+        let idx = self.get_shard_idx(data);
+        let mut shard = shards[idx].lock();
+        let found = shard.check(data, Instant::now(), window);
+        if found {
+            self.hits.fetch_add(1, Ordering::Relaxed);
+        }
+        found
+    }
+
     fn add_only(&self, data: &[u8], shards: &[Mutex<ReplayShard>], window: Duration) {
         self.additions.fetch_add(1, Ordering::Relaxed);
         let idx = self.get_shard_idx(data);
@@ -2186,7 +2274,7 @@ impl ReplayChecker {
         self.add_only(data, &self.handshake_shards, self.window)
     }
     pub fn check_tls_digest(&self, data: &[u8]) -> bool {
-        self.check_and_add_tls_digest(data)
+        self.check_only_internal(data, &self.tls_shards, self.tls_window)
     }
     pub fn add_tls_digest(&self, data: &[u8]) {
         self.add_only(data, &self.tls_shards, self.tls_window)
@@ -2290,6 +2378,7 @@ mod tests {
     use super::*;
     use crate::config::MeTelemetryLevel;
     use std::sync::Arc;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[test]
     fn test_stats_shared_counters() {
@@ -2457,6 +2546,137 @@ mod tests {
         }
         assert_eq!(checker.stats().total_entries, 500);
     }
+
+    #[test]
+    fn test_quota_reserve_under_contention_hits_limit_exactly() {
+        let user_stats = Arc::new(UserStats::default());
+        let successes = Arc::new(AtomicU64::new(0));
+        let limit = 8_192u64;
+        let mut workers = Vec::new();
+
+        for _ in 0..8 {
+            let user_stats = user_stats.clone();
+            let successes = successes.clone();
+            workers.push(std::thread::spawn(move || {
+                loop {
+                    match user_stats.quota_try_reserve(1, limit) {
+                        Ok(_) => {
+                            successes.fetch_add(1, Ordering::Relaxed);
+                        }
+                        Err(QuotaReserveError::Contended) => {
+                            std::hint::spin_loop();
+                        }
+                        Err(QuotaReserveError::LimitExceeded) => {
+                            break;
+                        }
+                    }
+                }
+            }));
+        }
+
+        for worker in workers {
+            worker.join().expect("worker thread must finish");
+        }
+
+        assert_eq!(
+            successes.load(Ordering::Relaxed),
+            limit,
+            "successful reservations must stop exactly at limit"
+        );
+        assert_eq!(user_stats.quota_used(), limit);
+    }
+
+    #[test]
+    fn test_quota_reserve_200x_1k_reaches_100k_without_overshoot() {
+        let user_stats = Arc::new(UserStats::default());
+        let successes = Arc::new(AtomicU64::new(0));
+        let failures = Arc::new(AtomicU64::new(0));
+        let attempts = 200usize;
+        let reserve_bytes = 1_024u64;
+        let limit = 100 * 1_024u64;
+        let mut workers = Vec::with_capacity(attempts);
+
+        for _ in 0..attempts {
+            let user_stats = user_stats.clone();
+            let successes = successes.clone();
+            let failures = failures.clone();
+            workers.push(std::thread::spawn(move || {
+                loop {
+                    match user_stats.quota_try_reserve(reserve_bytes, limit) {
+                        Ok(_) => {
+                            successes.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                        Err(QuotaReserveError::LimitExceeded) => {
+                            failures.fetch_add(1, Ordering::Relaxed);
+                            return;
+                        }
+                        Err(QuotaReserveError::Contended) => {
+                            std::hint::spin_loop();
+                        }
+                    }
+                }
+            }));
+        }
+
+        for worker in workers {
+            worker.join().expect("reservation worker must finish");
+        }
+
+        assert_eq!(
+            successes.load(Ordering::Relaxed),
+            100,
+            "exactly 100 reservations of 1 KiB must fit into a 100 KiB quota"
+        );
+        assert_eq!(
+            failures.load(Ordering::Relaxed),
+            100,
+            "remaining workers must fail once quota is fully reserved"
+        );
+        assert_eq!(user_stats.quota_used(), limit);
+    }
+
+    #[test]
+    fn test_quota_used_is_authoritative_and_independent_from_octets_telemetry() {
+        let stats = Stats::new();
+        let user = "quota-authoritative-user";
+        let user_stats = stats.get_or_create_user_stats_handle(user);
+
+        stats.add_user_octets_to_handle(&user_stats, 5);
+        assert_eq!(stats.get_user_total_octets(user), 5);
+        assert_eq!(stats.get_user_quota_used(user), 0);
+
+        stats.quota_charge_post_write(&user_stats, 7);
+        assert_eq!(stats.get_user_total_octets(user), 5);
+        assert_eq!(stats.get_user_quota_used(user), 7);
+    }
+
+    #[test]
+    fn test_cached_handle_survives_map_cleanup_until_last_drop() {
+        let stats = Stats::new();
+        let user = "quota-handle-lifetime-user";
+        let user_stats = stats.get_or_create_user_stats_handle(user);
+        let weak = Arc::downgrade(&user_stats);
+
+        stats.user_stats.remove(user);
+        assert!(
+            stats.user_stats.get(user).is_none(),
+            "map cleanup should remove idle entry"
+        );
+        assert!(
+            weak.upgrade().is_some(),
+            "cached handle must keep user stats object alive after map removal"
+        );
+
+        stats.quota_charge_post_write(user_stats.as_ref(), 3);
+        assert_eq!(user_stats.quota_used(), 3);
+
+        drop(user_stats);
+        assert!(
+            weak.upgrade().is_none(),
+            "user stats object must be dropped after the last cached handle is released"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2466,7 +2686,3 @@ mod connection_lease_security_tests;
 #[cfg(test)]
 #[path = "tests/replay_checker_security_tests.rs"]
 mod replay_checker_security_tests;
-
-#[cfg(test)]
-#[path = "tests/user_octets_sub_security_tests.rs"]
-mod user_octets_sub_security_tests;

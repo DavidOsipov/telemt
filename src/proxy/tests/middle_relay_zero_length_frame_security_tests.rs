@@ -2,10 +2,10 @@ use super::*;
 use crate::crypto::AesCtr;
 use crate::stats::Stats;
 use crate::stream::{BufferPool, CryptoReader};
-use std::sync::atomic::AtomicU64;
 use std::sync::Arc;
-use tokio::io::{AsyncRead, AsyncWriteExt, duplex};
+use std::sync::atomic::AtomicU64;
 use std::time::Instant;
+use tokio::io::{AsyncRead, AsyncWriteExt, duplex};
 
 fn make_crypto_reader<T>(reader: T) -> CryptoReader<T>
 where

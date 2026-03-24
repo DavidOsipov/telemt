@@ -11,17 +11,19 @@ use tracing::{debug, info, warn};
 
 use crate::config::ProxyConfig;
 use crate::error::Result;
+use crate::transport::UpstreamManager;
 
 use super::MePool;
+use super::http_fetch::https_get;
 use super::rotation::{MeReinitTrigger, enqueue_reinit_trigger};
-use super::secret::download_proxy_secret_with_max_len;
+use super::secret::download_proxy_secret_with_max_len_via_upstream;
 use super::selftest::record_timeskew_sample;
 use std::time::SystemTime;
 
-async fn retry_fetch(url: &str) -> Option<ProxyConfigData> {
+async fn retry_fetch(url: &str, upstream: Option<Arc<UpstreamManager>>) -> Option<ProxyConfigData> {
     let delays = [1u64, 5, 15];
     for (i, d) in delays.iter().enumerate() {
-        match fetch_proxy_config(url).await {
+        match fetch_proxy_config_via_upstream(url, upstream.clone()).await {
             Ok(cfg) => return Some(cfg),
             Err(e) => {
                 if i == delays.len() - 1 {
@@ -95,14 +97,19 @@ pub async fn save_proxy_config_cache(path: &str, raw_text: &str) -> Result<()> {
     Ok(())
 }
 
+#[allow(dead_code)]
 pub async fn fetch_proxy_config_with_raw(url: &str) -> Result<(ProxyConfigData, String)> {
-    let resp = reqwest::get(url).await.map_err(|e| {
-        crate::error::ProxyError::Proxy(format!("fetch_proxy_config GET failed: {e}"))
-    })?;
-    let http_status = resp.status().as_u16();
+    fetch_proxy_config_with_raw_via_upstream(url, None).await
+}
 
-    if let Some(date) = resp.headers().get(reqwest::header::DATE)
-        && let Ok(date_str) = date.to_str()
+pub async fn fetch_proxy_config_with_raw_via_upstream(
+    url: &str,
+    upstream: Option<Arc<UpstreamManager>>,
+) -> Result<(ProxyConfigData, String)> {
+    let resp = https_get(url, upstream).await?;
+    let http_status = resp.status;
+
+    if let Some(date_str) = resp.date_header.as_deref()
         && let Ok(server_time) = httpdate::parse_http_date(date_str)
         && let Ok(skew) = SystemTime::now()
             .duration_since(server_time)
@@ -123,9 +130,7 @@ pub async fn fetch_proxy_config_with_raw(url: &str) -> Result<(ProxyConfigData, 
         }
     }
 
-    let text = resp.text().await.map_err(|e| {
-        crate::error::ProxyError::Proxy(format!("fetch_proxy_config read failed: {e}"))
-    })?;
+    let text = String::from_utf8_lossy(&resp.body).into_owned();
     let parsed = parse_proxy_config_text(&text, http_status);
     Ok((parsed, text))
 }
@@ -260,8 +265,16 @@ fn parse_proxy_line(line: &str) -> Option<(i32, IpAddr, u16)> {
     Some((dc, ip, port))
 }
 
+#[allow(dead_code)]
 pub async fn fetch_proxy_config(url: &str) -> Result<ProxyConfigData> {
-    fetch_proxy_config_with_raw(url)
+    fetch_proxy_config_via_upstream(url, None).await
+}
+
+pub async fn fetch_proxy_config_via_upstream(
+    url: &str,
+    upstream: Option<Arc<UpstreamManager>>,
+) -> Result<ProxyConfigData> {
+    fetch_proxy_config_with_raw_via_upstream(url, upstream)
         .await
         .map(|(parsed, _raw)| parsed)
 }
@@ -300,6 +313,7 @@ async fn run_update_cycle(
     state: &mut UpdaterState,
     reinit_tx: &mpsc::Sender<MeReinitTrigger>,
 ) {
+    let upstream = pool.upstream.clone();
     pool.update_runtime_reinit_policy(
         cfg.general.hardswap,
         cfg.general.me_pool_drain_ttl_secs,
@@ -354,7 +368,7 @@ async fn run_update_cycle(
     let mut maps_changed = false;
 
     let mut ready_v4: Option<(ProxyConfigData, u64)> = None;
-    let cfg_v4 = retry_fetch("https://core.telegram.org/getProxyConfig").await;
+    let cfg_v4 = retry_fetch("https://core.telegram.org/getProxyConfig", upstream.clone()).await;
     if let Some(cfg_v4) = cfg_v4
         && snapshot_passes_guards(cfg, &cfg_v4, "getProxyConfig")
     {
@@ -378,7 +392,11 @@ async fn run_update_cycle(
     }
 
     let mut ready_v6: Option<(ProxyConfigData, u64)> = None;
-    let cfg_v6 = retry_fetch("https://core.telegram.org/getProxyConfigV6").await;
+    let cfg_v6 = retry_fetch(
+        "https://core.telegram.org/getProxyConfigV6",
+        upstream.clone(),
+    )
+    .await;
     if let Some(cfg_v6) = cfg_v6
         && snapshot_passes_guards(cfg, &cfg_v6, "getProxyConfigV6")
     {
@@ -456,7 +474,12 @@ async fn run_update_cycle(
     pool.reset_stun_state();
 
     if cfg.general.proxy_secret_rotate_runtime {
-        match download_proxy_secret_with_max_len(cfg.general.proxy_secret_len_max).await {
+        match download_proxy_secret_with_max_len_via_upstream(
+            cfg.general.proxy_secret_len_max,
+            upstream,
+        )
+        .await
+        {
             Ok(secret) => {
                 let secret_hash = hash_secret(&secret);
                 let stable_hits = state.secret.observe(secret_hash);

@@ -35,7 +35,10 @@ async fn run_prefetch_budget_case(prefetch_budget_ms: u64, delayed_tail_ms: u64)
             .write_all(b"ONNECT example.org:443 HTTP/1.1\r\n")
             .await
             .expect("tail bytes must be writable");
-        writer.shutdown().await.expect("writer shutdown must succeed");
+        writer
+            .shutdown()
+            .await
+            .expect("writer shutdown must succeed");
     });
 
     let mut initial_data = b"C".to_vec();

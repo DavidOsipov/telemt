@@ -6,6 +6,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt, duplex};
 
+fn preload_user_quota(stats: &Stats, user: &str, bytes: u64) {
+    let user_stats = stats.get_or_create_user_stats_handle(user);
+    stats.quota_charge_post_write(user_stats.as_ref(), bytes);
+}
+
 #[tokio::test]
 async fn edge_mask_delay_bypassed_if_max_is_zero() {
     let mut config = ProxyConfig::default();
@@ -42,17 +47,13 @@ async fn boundary_user_data_quota_exact_match_rejects() {
     config.access.user_data_quota.insert(user.to_string(), 1024);
 
     let stats = Arc::new(Stats::new());
-    stats.add_user_octets_from(user, 1024);
+    preload_user_quota(stats.as_ref(), user, 1024);
 
     let ip_tracker = Arc::new(UserIpTracker::new());
     let peer = "198.51.100.10:55000".parse().unwrap();
 
     let result = RunningClientHandler::acquire_user_connection_reservation_static(
-        user,
-        &config,
-        stats,
-        peer,
-        ip_tracker,
+        user, &config, stats, peer, ip_tracker,
     )
     .await;
 
@@ -74,11 +75,7 @@ async fn boundary_user_expiration_in_past_rejects() {
     let peer = "198.51.100.11:55000".parse().unwrap();
 
     let result = RunningClientHandler::acquire_user_connection_reservation_static(
-        user,
-        &config,
-        stats,
-        peer,
-        ip_tracker,
+        user, &config, stats, peer, ip_tracker,
     )
     .await;
 
@@ -98,7 +95,15 @@ async fn blackhat_proxy_protocol_massive_garbage_rejected_quickly() {
         "198.51.100.12:55000".parse().unwrap(),
         config,
         stats.clone(),
-        Arc::new(UpstreamManager::new(vec![], 1, 1, 1, 1, false, stats.clone())),
+        Arc::new(UpstreamManager::new(
+            vec![],
+            1,
+            1,
+            1,
+            1,
+            false,
+            stats.clone(),
+        )),
         Arc::new(ReplayChecker::new(128, Duration::from_secs(60))),
         Arc::new(BufferPool::new()),
         Arc::new(SecureRandom::new()),
@@ -136,7 +141,15 @@ async fn edge_tls_body_immediate_eof_triggers_masking_and_bad_connect() {
         "198.51.100.13:55000".parse().unwrap(),
         config,
         stats.clone(),
-        Arc::new(UpstreamManager::new(vec![], 1, 1, 1, 1, false, stats.clone())),
+        Arc::new(UpstreamManager::new(
+            vec![],
+            1,
+            1,
+            1,
+            1,
+            false,
+            stats.clone(),
+        )),
         Arc::new(ReplayChecker::new(128, Duration::from_secs(60))),
         Arc::new(BufferPool::new()),
         Arc::new(SecureRandom::new()),
@@ -148,10 +161,15 @@ async fn edge_tls_body_immediate_eof_triggers_masking_and_bad_connect() {
         false,
     ));
 
-    client_side.write_all(&[0x16, 0x03, 0x01, 0x00, 100]).await.unwrap();
+    client_side
+        .write_all(&[0x16, 0x03, 0x01, 0x00, 100])
+        .await
+        .unwrap();
     client_side.shutdown().await.unwrap();
 
-    let _ = tokio::time::timeout(Duration::from_secs(2), handler).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handler)
+        .await
+        .unwrap();
 
     assert_eq!(stats.get_connects_bad(), 1);
 }
@@ -172,7 +190,15 @@ async fn security_classic_mode_disabled_masks_valid_length_payload() {
         "198.51.100.15:55000".parse().unwrap(),
         config,
         stats.clone(),
-        Arc::new(UpstreamManager::new(vec![], 1, 1, 1, 1, false, stats.clone())),
+        Arc::new(UpstreamManager::new(
+            vec![],
+            1,
+            1,
+            1,
+            1,
+            false,
+            stats.clone(),
+        )),
         Arc::new(ReplayChecker::new(128, Duration::from_secs(60))),
         Arc::new(BufferPool::new()),
         Arc::new(SecureRandom::new()),
@@ -187,7 +213,9 @@ async fn security_classic_mode_disabled_masks_valid_length_payload() {
     client_side.write_all(&vec![0xEF; 64]).await.unwrap();
     client_side.shutdown().await.unwrap();
 
-    let _ = tokio::time::timeout(Duration::from_secs(2), handler).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handler)
+        .await
+        .unwrap();
     assert_eq!(stats.get_connects_bad(), 1);
 }
 
@@ -195,7 +223,10 @@ async fn security_classic_mode_disabled_masks_valid_length_payload() {
 async fn concurrency_ip_tracker_strict_limit_one_rapid_churn() {
     let user = "rapid-churn-user";
     let mut config = ProxyConfig::default();
-    config.access.user_max_tcp_conns.insert(user.to_string(), 10);
+    config
+        .access
+        .user_max_tcp_conns
+        .insert(user.to_string(), 10);
 
     let stats = Arc::new(Stats::new());
     let ip_tracker = Arc::new(UserIpTracker::new());

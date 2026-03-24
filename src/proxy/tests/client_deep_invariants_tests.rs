@@ -7,6 +7,11 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, duplex};
 
+fn preload_user_quota(stats: &Stats, user: &str, bytes: u64) {
+    let user_stats = stats.get_or_create_user_stats_handle(user);
+    stats.quota_charge_post_write(user_stats.as_ref(), bytes);
+}
+
 #[test]
 fn invariant_wrap_tls_application_record_exact_multiples() {
     let chunk_size = u16::MAX as usize;
@@ -37,7 +42,15 @@ async fn invariant_tls_clienthello_truncation_exact_boundary_triggers_masking() 
         "198.51.100.20:55000".parse().unwrap(),
         config,
         stats.clone(),
-        Arc::new(UpstreamManager::new(vec![], 1, 1, 1, 1, false, stats.clone())),
+        Arc::new(UpstreamManager::new(
+            vec![],
+            1,
+            1,
+            1,
+            1,
+            false,
+            stats.clone(),
+        )),
         Arc::new(ReplayChecker::new(128, Duration::from_secs(60))),
         Arc::new(BufferPool::new()),
         Arc::new(SecureRandom::new()),
@@ -60,7 +73,9 @@ async fn invariant_tls_clienthello_truncation_exact_boundary_triggers_masking() 
         .unwrap();
     client_side.shutdown().await.unwrap();
 
-    let _ = tokio::time::timeout(Duration::from_secs(2), handler).await.unwrap();
+    let _ = tokio::time::timeout(Duration::from_secs(2), handler)
+        .await
+        .unwrap();
     assert_eq!(stats.get_connects_bad(), 1);
 }
 
@@ -68,7 +83,10 @@ async fn invariant_tls_clienthello_truncation_exact_boundary_triggers_masking() 
 async fn invariant_acquire_reservation_ip_limit_rollback() {
     let user = "rollback-test-user";
     let mut config = ProxyConfig::default();
-    config.access.user_max_tcp_conns.insert(user.to_string(), 10);
+    config
+        .access
+        .user_max_tcp_conns
+        .insert(user.to_string(), 10);
 
     let stats = Arc::new(Stats::new());
     let ip_tracker = Arc::new(UserIpTracker::new());
@@ -114,7 +132,7 @@ async fn invariant_quota_exact_boundary_inclusive() {
     let ip_tracker = Arc::new(UserIpTracker::new());
     let peer = "198.51.100.23:55000".parse().unwrap();
 
-    stats.add_user_octets_from(user, 999);
+    preload_user_quota(stats.as_ref(), user, 999);
     let res1 = RunningClientHandler::acquire_user_connection_reservation_static(
         user,
         &config,
@@ -126,7 +144,7 @@ async fn invariant_quota_exact_boundary_inclusive() {
     assert!(res1.is_ok());
     res1.unwrap().release().await;
 
-    stats.add_user_octets_from(user, 1);
+    preload_user_quota(stats.as_ref(), user, 1);
     let res2 = RunningClientHandler::acquire_user_connection_reservation_static(
         user,
         &config,
@@ -154,7 +172,15 @@ async fn invariant_direct_mode_partial_header_eof_is_error_not_bad_connect() {
         "198.51.100.25:55000".parse().unwrap(),
         config,
         stats.clone(),
-        Arc::new(UpstreamManager::new(vec![], 1, 1, 1, 1, false, stats.clone())),
+        Arc::new(UpstreamManager::new(
+            vec![],
+            1,
+            1,
+            1,
+            1,
+            false,
+            stats.clone(),
+        )),
         Arc::new(ReplayChecker::new(128, Duration::from_secs(60))),
         Arc::new(BufferPool::new()),
         Arc::new(SecureRandom::new()),

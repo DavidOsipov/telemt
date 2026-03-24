@@ -40,7 +40,10 @@ async fn adversarial_delayed_interface_lookup_does_not_consume_outcome_floor_bud
 
     tokio::time::sleep(Duration::from_millis(80)).await;
     drop(held_refresh_guard);
-    client.shutdown().await.expect("client shutdown must succeed");
+    client
+        .shutdown()
+        .await
+        .expect("client shutdown must succeed");
 
     timeout(Duration::from_secs(2), task)
         .await

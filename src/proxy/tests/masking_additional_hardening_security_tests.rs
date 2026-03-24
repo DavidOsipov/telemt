@@ -78,7 +78,11 @@ fn timing_normalization_zero_floor_safety_net_defaults_to_mask_timeout() {
     config.censorship.mask_timing_normalization_ceiling_ms = 0;
 
     let budget = mask_outcome_target_budget(&config);
-    assert_eq!(budget, MASK_TIMEOUT);
+    assert_eq!(
+        budget,
+        Duration::from_millis(0),
+        "zero floor/ceiling must produce zero extra normalization budget"
+    );
 }
 
 #[tokio::test]

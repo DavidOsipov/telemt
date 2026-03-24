@@ -2,7 +2,13 @@ use super::*;
 
 #[test]
 fn exact_four_byte_http_tokens_are_classified() {
-    for token in [b"GET ".as_ref(), b"POST".as_ref(), b"HEAD".as_ref(), b"PUT ".as_ref(), b"PRI ".as_ref()] {
+    for token in [
+        b"GET ".as_ref(),
+        b"POST".as_ref(),
+        b"HEAD".as_ref(),
+        b"PUT ".as_ref(),
+        b"PRI ".as_ref(),
+    ] {
         assert!(
             is_http_probe(token),
             "exact 4-byte token must be classified as HTTP probe: {:?}",

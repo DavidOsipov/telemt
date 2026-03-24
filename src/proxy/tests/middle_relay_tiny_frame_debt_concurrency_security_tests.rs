@@ -217,7 +217,9 @@ async fn adversarial_lockstep_alternating_attack_under_jitter_closes() {
                 }
             }
 
-            writer_task.await.expect("writer jitter task must not panic");
+            writer_task
+                .await
+                .expect("writer jitter task must not panic");
             assert!(closed, "alternating attack must close before EOF");
         });
     }
@@ -247,7 +249,10 @@ async fn integration_mixed_population_attackers_close_benign_survive() {
                     plaintext.push(0x01);
                     plaintext.extend_from_slice(&[n, n, n, n]);
                 }
-                writer.write_all(&encrypt_for_reader(&plaintext)).await.unwrap();
+                writer
+                    .write_all(&encrypt_for_reader(&plaintext))
+                    .await
+                    .unwrap();
                 drop(writer);
 
                 let mut closed = false;
@@ -279,7 +284,10 @@ async fn integration_mixed_population_attackers_close_benign_survive() {
                 }
                 plaintext.push(0x01);
                 plaintext.extend_from_slice(&payload);
-                writer.write_all(&encrypt_for_reader(&plaintext)).await.unwrap();
+                writer
+                    .write_all(&encrypt_for_reader(&plaintext))
+                    .await
+                    .unwrap();
 
                 let got = read_once(
                     &mut crypto_reader,
@@ -329,7 +337,10 @@ async fn light_fuzz_parallel_patterns_no_hang_or_panic() {
                 }
             }
 
-            writer.write_all(&encrypt_for_reader(&plaintext)).await.unwrap();
+            writer
+                .write_all(&encrypt_for_reader(&plaintext))
+                .await
+                .unwrap();
             drop(writer);
 
             for _ in 0..320 {

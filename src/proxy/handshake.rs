@@ -16,7 +16,7 @@ use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tracing::{debug, trace, warn};
 use zeroize::{Zeroize, Zeroizing};
 
-use crate::config::ProxyConfig;
+use crate::config::{ProxyConfig, UnknownSniAction};
 use crate::crypto::{AesCtr, SecureRandom, sha256};
 use crate::error::{HandshakeResult, ProxyError};
 use crate::protocol::constants::*;
@@ -282,30 +282,9 @@ fn auth_probe_record_failure_with_state(
             let mut eviction_candidate: Option<(IpAddr, u32, Instant)> = None;
             let state_len = state.len();
             let scan_limit = state_len.min(AUTH_PROBE_PRUNE_SCAN_LIMIT);
-            let start_offset = auth_probe_scan_start_offset(peer_ip, now, state_len, scan_limit);
 
-            let mut scanned = 0usize;
-            for entry in state.iter().skip(start_offset) {
-                let key = *entry.key();
-                let fail_streak = entry.value().fail_streak;
-                let last_seen = entry.value().last_seen;
-                match eviction_candidate {
-                    Some((_, current_fail, current_seen))
-                        if fail_streak > current_fail
-                            || (fail_streak == current_fail && last_seen >= current_seen) => {}
-                    _ => eviction_candidate = Some((key, fail_streak, last_seen)),
-                }
-                if auth_probe_state_expired(entry.value(), now) {
-                    stale_keys.push(key);
-                }
-                scanned += 1;
-                if scanned >= scan_limit {
-                    break;
-                }
-            }
-
-            if scanned < scan_limit {
-                for entry in state.iter().take(scan_limit - scanned) {
+            if state_len <= AUTH_PROBE_PRUNE_SCAN_LIMIT {
+                for entry in state.iter() {
                     let key = *entry.key();
                     let fail_streak = entry.value().fail_streak;
                     let last_seen = entry.value().last_seen;
@@ -317,6 +296,46 @@ fn auth_probe_record_failure_with_state(
                     }
                     if auth_probe_state_expired(entry.value(), now) {
                         stale_keys.push(key);
+                    }
+                }
+            } else {
+                let start_offset =
+                    auth_probe_scan_start_offset(peer_ip, now, state_len, scan_limit);
+                let mut scanned = 0usize;
+                for entry in state.iter().skip(start_offset) {
+                    let key = *entry.key();
+                    let fail_streak = entry.value().fail_streak;
+                    let last_seen = entry.value().last_seen;
+                    match eviction_candidate {
+                        Some((_, current_fail, current_seen))
+                            if fail_streak > current_fail
+                                || (fail_streak == current_fail && last_seen >= current_seen) => {}
+                        _ => eviction_candidate = Some((key, fail_streak, last_seen)),
+                    }
+                    if auth_probe_state_expired(entry.value(), now) {
+                        stale_keys.push(key);
+                    }
+                    scanned += 1;
+                    if scanned >= scan_limit {
+                        break;
+                    }
+                }
+
+                if scanned < scan_limit {
+                    for entry in state.iter().take(scan_limit - scanned) {
+                        let key = *entry.key();
+                        let fail_streak = entry.value().fail_streak;
+                        let last_seen = entry.value().last_seen;
+                        match eviction_candidate {
+                            Some((_, current_fail, current_seen))
+                                if fail_streak > current_fail
+                                    || (fail_streak == current_fail
+                                        && last_seen >= current_seen) => {}
+                            _ => eviction_candidate = Some((key, fail_streak, last_seen)),
+                        }
+                        if auth_probe_state_expired(entry.value(), now) {
+                            stale_keys.push(key);
+                        }
                     }
                 }
             }
@@ -510,6 +529,21 @@ fn decode_user_secrets(
     secrets
 }
 
+#[inline]
+fn find_matching_tls_domain<'a>(config: &'a ProxyConfig, sni: &str) -> Option<&'a str> {
+    if config.censorship.tls_domain.eq_ignore_ascii_case(sni) {
+        return Some(config.censorship.tls_domain.as_str());
+    }
+
+    for domain in &config.censorship.tls_domains {
+        if domain.eq_ignore_ascii_case(sni) {
+            return Some(domain.as_str());
+        }
+    }
+
+    None
+}
+
 async fn maybe_apply_server_hello_delay(config: &ProxyConfig) {
     if config.censorship.server_hello_delay_max_ms == 0 {
         return;
@@ -593,60 +627,12 @@ where
     }
 
     let client_sni = tls::extract_sni_from_client_hello(handshake);
-    let secrets = decode_user_secrets(config, client_sni.as_deref());
-
-    let validation = match tls::validate_tls_handshake_with_replay_window(
-        handshake,
-        &secrets,
-        config.access.ignore_time_skew,
-        config.access.replay_window_secs,
-    ) {
-        Some(v) => v,
-        None => {
-            auth_probe_record_failure(peer.ip(), Instant::now());
-            maybe_apply_server_hello_delay(config).await;
-            debug!(
-                peer = %peer,
-                ignore_time_skew = config.access.ignore_time_skew,
-                "TLS handshake validation failed - no matching user or time skew"
-            );
-            return HandshakeResult::BadClient { reader, writer };
-        }
-    };
-
-    let secret = match secrets.iter().find(|(name, _)| *name == validation.user) {
-        Some((_, s)) => s,
-        None => {
-            maybe_apply_server_hello_delay(config).await;
-            return HandshakeResult::BadClient { reader, writer };
-        }
-    };
-
-    let cached = if config.censorship.tls_emulation {
-        if let Some(cache) = tls_cache.as_ref() {
-            let selected_domain = if let Some(sni) = client_sni.as_ref() {
-                if cache.contains_domain(sni).await {
-                    sni.clone()
-                } else {
-                    config.censorship.tls_domain.clone()
-                }
-            } else {
-                config.censorship.tls_domain.clone()
-            };
-            let cached_entry = cache.get(&selected_domain).await;
-            let use_full_cert_payload = cache
-                .take_full_cert_budget_for_ip(
-                    peer.ip(),
-                    Duration::from_secs(config.censorship.tls_full_cert_ttl_secs),
-                )
-                .await;
-            Some((cached_entry, use_full_cert_payload))
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let preferred_user_hint = client_sni
+        .as_deref()
+        .filter(|sni| config.access.users.contains_key(*sni));
+    let matched_tls_domain = client_sni
+        .as_deref()
+        .and_then(|sni| find_matching_tls_domain(config, sni));
 
     let alpn_list = if config.censorship.alpn_enforce {
         tls::extract_alpn_from_client_hello(handshake)
@@ -669,15 +655,80 @@ where
         None
     };
 
-    // Replay tracking is applied only after full policy validation (including
-    // ALPN checks) so rejected handshakes cannot poison replay state.
+    if client_sni.is_some() && matched_tls_domain.is_none() && preferred_user_hint.is_none() {
+        auth_probe_record_failure(peer.ip(), Instant::now());
+        maybe_apply_server_hello_delay(config).await;
+        debug!(
+            peer = %peer,
+            sni = ?client_sni,
+            action = ?config.censorship.unknown_sni_action,
+            "TLS handshake rejected by unknown SNI policy"
+        );
+        return match config.censorship.unknown_sni_action {
+            UnknownSniAction::Drop => HandshakeResult::Error(ProxyError::UnknownTlsSni),
+            UnknownSniAction::Mask => HandshakeResult::BadClient { reader, writer },
+        };
+    }
+
+    let secrets = decode_user_secrets(config, preferred_user_hint);
+
+    let validation = match tls::validate_tls_handshake_with_replay_window(
+        handshake,
+        &secrets,
+        config.access.ignore_time_skew,
+        config.access.replay_window_secs,
+    ) {
+        Some(v) => v,
+        None => {
+            auth_probe_record_failure(peer.ip(), Instant::now());
+            maybe_apply_server_hello_delay(config).await;
+            debug!(
+                peer = %peer,
+                ignore_time_skew = config.access.ignore_time_skew,
+                "TLS handshake validation failed - no matching user or time skew"
+            );
+            return HandshakeResult::BadClient { reader, writer };
+        }
+    };
+
+    // Reject known replay digests before expensive cache/domain/ALPN policy work.
     let digest_half = &validation.digest[..tls::TLS_DIGEST_HALF_LEN];
-    if replay_checker.check_and_add_tls_digest(digest_half) {
+    if replay_checker.check_tls_digest(digest_half) {
         auth_probe_record_failure(peer.ip(), Instant::now());
         maybe_apply_server_hello_delay(config).await;
         warn!(peer = %peer, "TLS replay attack detected (duplicate digest)");
         return HandshakeResult::BadClient { reader, writer };
     }
+
+    let secret = match secrets.iter().find(|(name, _)| *name == validation.user) {
+        Some((_, s)) => s,
+        None => {
+            maybe_apply_server_hello_delay(config).await;
+            return HandshakeResult::BadClient { reader, writer };
+        }
+    };
+
+    let cached = if config.censorship.tls_emulation {
+        if let Some(cache) = tls_cache.as_ref() {
+            let selected_domain =
+                matched_tls_domain.unwrap_or(config.censorship.tls_domain.as_str());
+            let cached_entry = cache.get(selected_domain).await;
+            let use_full_cert_payload = cache
+                .take_full_cert_budget_for_ip(
+                    peer.ip(),
+                    Duration::from_secs(config.censorship.tls_full_cert_ttl_secs),
+                )
+                .await;
+            Some((cached_entry, use_full_cert_payload))
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    // Add replay digest only for policy-valid handshakes.
+    replay_checker.add_tls_digest(digest_half);
 
     let response = if let Some((cached_entry, use_full_cert_payload)) = cached {
         emulator::build_emulated_server_hello(
