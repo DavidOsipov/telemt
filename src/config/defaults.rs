@@ -110,7 +110,11 @@ pub(crate) fn default_replay_window_secs() -> u64 {
 }
 
 pub(crate) fn default_handshake_timeout() -> u64 {
-    30
+    60
+}
+
+pub(crate) fn default_client_first_byte_idle_secs() -> u64 {
+    300
 }
 
 pub(crate) fn default_relay_idle_policy_v2_enabled() -> bool {
@@ -207,6 +211,10 @@ pub(crate) fn default_proxy_protocol_trusted_cidrs() -> Vec<IpNetwork> {
 
 pub(crate) fn default_server_max_connections() -> u32 {
     10_000
+}
+
+pub(crate) fn default_listen_backlog() -> u32 {
+    1024
 }
 
 pub(crate) fn default_accept_permit_timeout_ms() -> u64 {
@@ -801,6 +809,10 @@ pub(crate) fn default_access_users() -> HashMap<String, String> {
 
 pub(crate) fn default_user_max_unique_ips_window_secs() -> u64 {
     DEFAULT_USER_MAX_UNIQUE_IPS_WINDOW_SECS
+}
+
+pub(crate) fn default_user_max_tcp_conns_global_each() -> usize {
+    0
 }
 
 pub(crate) fn default_user_max_unique_ips_global_each() -> usize {
