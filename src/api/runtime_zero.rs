@@ -50,6 +50,7 @@ pub(super) struct RuntimeGatesData {
 
 #[derive(Serialize)]
 pub(super) struct EffectiveTimeoutLimits {
+    pub(super) client_first_byte_idle_secs: u64,
     pub(super) client_handshake_secs: u64,
     pub(super) tg_connect_secs: u64,
     pub(super) client_keepalive_secs: u64,
@@ -100,6 +101,11 @@ pub(super) struct EffectiveUserIpPolicyLimits {
 }
 
 #[derive(Serialize)]
+pub(super) struct EffectiveUserTcpPolicyLimits {
+    pub(super) global_each: usize,
+}
+
+#[derive(Serialize)]
 pub(super) struct EffectiveLimitsData {
     pub(super) update_every_secs: u64,
     pub(super) me_reinit_every_secs: u64,
@@ -108,6 +114,7 @@ pub(super) struct EffectiveLimitsData {
     pub(super) upstream: EffectiveUpstreamLimits,
     pub(super) middle_proxy: EffectiveMiddleProxyLimits,
     pub(super) user_ip_policy: EffectiveUserIpPolicyLimits,
+    pub(super) user_tcp_policy: EffectiveUserTcpPolicyLimits,
 }
 
 #[derive(Serialize)]
@@ -227,8 +234,9 @@ pub(super) fn build_limits_effective_data(cfg: &ProxyConfig) -> EffectiveLimitsD
         me_reinit_every_secs: cfg.general.effective_me_reinit_every_secs(),
         me_pool_force_close_secs: cfg.general.effective_me_pool_force_close_secs(),
         timeouts: EffectiveTimeoutLimits {
+            client_first_byte_idle_secs: cfg.timeouts.client_first_byte_idle_secs,
             client_handshake_secs: cfg.timeouts.client_handshake,
-            tg_connect_secs: cfg.timeouts.tg_connect,
+            tg_connect_secs: cfg.general.tg_connect,
             client_keepalive_secs: cfg.timeouts.client_keepalive,
             client_ack_secs: cfg.timeouts.client_ack,
             me_one_retry: cfg.timeouts.me_one_retry,
@@ -286,6 +294,9 @@ pub(super) fn build_limits_effective_data(cfg: &ProxyConfig) -> EffectiveLimitsD
             global_each: cfg.access.user_max_unique_ips_global_each,
             mode: user_max_unique_ips_mode_label(cfg.access.user_max_unique_ips_mode),
             window_secs: cfg.access.user_max_unique_ips_window_secs,
+        },
+        user_tcp_policy: EffectiveUserTcpPolicyLimits {
+            global_each: cfg.access.user_max_tcp_conns_global_each,
         },
     }
 }

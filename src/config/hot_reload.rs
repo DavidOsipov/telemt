@@ -117,6 +117,7 @@ pub struct HotFields {
     pub users: std::collections::HashMap<String, String>,
     pub user_ad_tags: std::collections::HashMap<String, String>,
     pub user_max_tcp_conns: std::collections::HashMap<String, usize>,
+    pub user_max_tcp_conns_global_each: usize,
     pub user_expirations: std::collections::HashMap<String, chrono::DateTime<chrono::Utc>>,
     pub user_data_quota: std::collections::HashMap<String, u64>,
     pub user_max_unique_ips: std::collections::HashMap<String, usize>,
@@ -240,6 +241,7 @@ impl HotFields {
             users: cfg.access.users.clone(),
             user_ad_tags: cfg.access.user_ad_tags.clone(),
             user_max_tcp_conns: cfg.access.user_max_tcp_conns.clone(),
+            user_max_tcp_conns_global_each: cfg.access.user_max_tcp_conns_global_each,
             user_expirations: cfg.access.user_expirations.clone(),
             user_data_quota: cfg.access.user_data_quota.clone(),
             user_max_unique_ips: cfg.access.user_max_unique_ips.clone(),
@@ -530,6 +532,7 @@ fn overlay_hot_fields(old: &ProxyConfig, new: &ProxyConfig) -> ProxyConfig {
     cfg.access.users = new.access.users.clone();
     cfg.access.user_ad_tags = new.access.user_ad_tags.clone();
     cfg.access.user_max_tcp_conns = new.access.user_max_tcp_conns.clone();
+    cfg.access.user_max_tcp_conns_global_each = new.access.user_max_tcp_conns_global_each;
     cfg.access.user_expirations = new.access.user_expirations.clone();
     cfg.access.user_data_quota = new.access.user_data_quota.clone();
     cfg.access.user_max_unique_ips = new.access.user_max_unique_ips.clone();
@@ -570,6 +573,7 @@ fn warn_non_hot_changes(old: &ProxyConfig, new: &ProxyConfig, non_hot_changed: b
     }
     if old.server.proxy_protocol != new.server.proxy_protocol
         || !listeners_equal(&old.server.listeners, &new.server.listeners)
+        || old.server.listen_backlog != new.server.listen_backlog
         || old.server.listen_addr_ipv4 != new.server.listen_addr_ipv4
         || old.server.listen_addr_ipv6 != new.server.listen_addr_ipv6
         || old.server.listen_tcp != new.server.listen_tcp
@@ -695,6 +699,7 @@ fn warn_non_hot_changes(old: &ProxyConfig, new: &ProxyConfig, non_hot_changed: b
     if old.general.upstream_connect_retry_attempts != new.general.upstream_connect_retry_attempts
         || old.general.upstream_connect_retry_backoff_ms
             != new.general.upstream_connect_retry_backoff_ms
+        || old.general.tg_connect != new.general.tg_connect
         || old.general.upstream_unhealthy_fail_threshold
             != new.general.upstream_unhealthy_fail_threshold
         || old.general.upstream_connect_failfast_hard_errors
@@ -1141,6 +1146,12 @@ fn log_changes(
         info!(
             "config reload: user_max_tcp_conns updated ({} entries)",
             new_hot.user_max_tcp_conns.len()
+        );
+    }
+    if old_hot.user_max_tcp_conns_global_each != new_hot.user_max_tcp_conns_global_each {
+        info!(
+            "config reload: user_max_tcp_conns policy global_each={}",
+            new_hot.user_max_tcp_conns_global_each
         );
     }
     if old_hot.user_expirations != new_hot.user_expirations {

@@ -663,6 +663,10 @@ pub struct GeneralConfig {
     #[serde(default = "default_upstream_connect_budget_ms")]
     pub upstream_connect_budget_ms: u64,
 
+    /// Per-attempt TCP connect timeout to Telegram DC (seconds).
+    #[serde(default = "default_connect_timeout")]
+    pub tg_connect: u64,
+
     /// Consecutive failed requests before upstream is marked unhealthy.
     #[serde(default = "default_upstream_unhealthy_fail_threshold")]
     pub upstream_unhealthy_fail_threshold: u32,
@@ -1007,6 +1011,7 @@ impl Default for GeneralConfig {
             upstream_connect_retry_attempts: default_upstream_connect_retry_attempts(),
             upstream_connect_retry_backoff_ms: default_upstream_connect_retry_backoff_ms(),
             upstream_connect_budget_ms: default_upstream_connect_budget_ms(),
+            tg_connect: default_connect_timeout(),
             upstream_unhealthy_fail_threshold: default_upstream_unhealthy_fail_threshold(),
             upstream_connect_failfast_hard_errors: default_upstream_connect_failfast_hard_errors(),
             stun_iface_mismatch_ignore: false,
@@ -1272,6 +1277,11 @@ pub struct ServerConfig {
     #[serde(default)]
     pub listeners: Vec<ListenerConfig>,
 
+    /// TCP `listen(2)` backlog for client-facing sockets (also used for the metrics HTTP listener).
+    /// The effective queue is capped by the kernel (for example `somaxconn` on Linux).
+    #[serde(default = "default_listen_backlog")]
+    pub listen_backlog: u32,
+
     /// Maximum number of concurrent client connections.
     /// 0 means unlimited.
     #[serde(default = "default_server_max_connections")]
@@ -1300,6 +1310,7 @@ impl Default for ServerConfig {
             metrics_whitelist: default_metrics_whitelist(),
             api: ApiConfig::default(),
             listeners: Vec::new(),
+            listen_backlog: default_listen_backlog(),
             max_connections: default_server_max_connections(),
             accept_permit_timeout_ms: default_accept_permit_timeout_ms(),
         }
@@ -1308,6 +1319,12 @@ impl Default for ServerConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TimeoutsConfig {
+    /// Maximum idle wait in seconds for the first client byte before handshake parsing starts.
+    /// `0` disables the separate idle phase and keeps legacy timeout behavior.
+    #[serde(default = "default_client_first_byte_idle_secs")]
+    pub client_first_byte_idle_secs: u64,
+
+    /// Maximum active handshake duration in seconds after the first client byte is received.
     #[serde(default = "default_handshake_timeout")]
     pub client_handshake: u64,
 
@@ -1329,9 +1346,6 @@ pub struct TimeoutsConfig {
     #[serde(default = "default_relay_idle_grace_after_downstream_activity_secs")]
     pub relay_idle_grace_after_downstream_activity_secs: u64,
 
-    #[serde(default = "default_connect_timeout")]
-    pub tg_connect: u64,
-
     #[serde(default = "default_keepalive")]
     pub client_keepalive: u64,
 
@@ -1350,13 +1364,13 @@ pub struct TimeoutsConfig {
 impl Default for TimeoutsConfig {
     fn default() -> Self {
         Self {
+            client_first_byte_idle_secs: default_client_first_byte_idle_secs(),
             client_handshake: default_handshake_timeout(),
             relay_idle_policy_v2_enabled: default_relay_idle_policy_v2_enabled(),
             relay_client_idle_soft_secs: default_relay_client_idle_soft_secs(),
             relay_client_idle_hard_secs: default_relay_client_idle_hard_secs(),
             relay_idle_grace_after_downstream_activity_secs:
                 default_relay_idle_grace_after_downstream_activity_secs(),
-            tg_connect: default_connect_timeout(),
             client_keepalive: default_keepalive(),
             client_ack: default_ack_timeout(),
             me_one_retry: default_me_one_retry(),
@@ -1619,6 +1633,12 @@ pub struct AccessConfig {
     #[serde(default)]
     pub user_max_tcp_conns: HashMap<String, usize>,
 
+    /// Global per-user TCP connection limit applied when a user has no
+    /// positive individual override.
+    /// `0` disables the inherited limit.
+    #[serde(default = "default_user_max_tcp_conns_global_each")]
+    pub user_max_tcp_conns_global_each: usize,
+
     #[serde(default)]
     pub user_expirations: HashMap<String, DateTime<Utc>>,
 
@@ -1655,6 +1675,7 @@ impl Default for AccessConfig {
             users: default_access_users(),
             user_ad_tags: HashMap::new(),
             user_max_tcp_conns: HashMap::new(),
+            user_max_tcp_conns_global_each: default_user_max_tcp_conns_global_each(),
             user_expirations: HashMap::new(),
             user_data_quota: HashMap::new(),
             user_max_unique_ips: HashMap::new(),

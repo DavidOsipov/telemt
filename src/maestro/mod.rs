@@ -47,8 +47,55 @@ use crate::transport::UpstreamManager;
 use crate::transport::middle_proxy::MePool;
 use helpers::{parse_cli, resolve_runtime_config_path};
 
+#[cfg(unix)]
+use crate::daemon::{DaemonOptions, PidFile, drop_privileges};
+
 /// Runs the full telemt runtime startup pipeline and blocks until shutdown.
+///
+/// On Unix, daemon options should be handled before calling this function
+/// (daemonization must happen before tokio runtime starts).
+#[cfg(unix)]
+pub async fn run_with_daemon(
+    daemon_opts: DaemonOptions,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    run_inner(daemon_opts).await
+}
+
+/// Runs the full telemt runtime startup pipeline and blocks until shutdown.
+///
+/// This is the main entry point for non-daemon mode or when called as a library.
+#[allow(dead_code)]
 pub async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
+    #[cfg(unix)]
+    {
+        // Parse CLI to get daemon options even in simple run() path
+        let args: Vec<String> = std::env::args().skip(1).collect();
+        let daemon_opts = crate::cli::parse_daemon_args(&args);
+        run_inner(daemon_opts).await
+    }
+    #[cfg(not(unix))]
+    {
+        run_inner().await
+    }
+}
+
+#[cfg(unix)]
+async fn run_inner(
+    daemon_opts: DaemonOptions,
+) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    // Acquire PID file if daemonizing or if explicitly requested
+    // Keep it alive until shutdown (underscore prefix = intentionally kept for RAII cleanup)
+    let _pid_file = if daemon_opts.daemonize || daemon_opts.pid_file.is_some() {
+        let mut pf = PidFile::new(daemon_opts.pid_file_path());
+        if let Err(e) = pf.acquire() {
+            eprintln!("[telemt] {}", e);
+            std::process::exit(1);
+        }
+        Some(pf)
+    } else {
+        None
+    };
+
     let process_started_at = Instant::now();
     let process_started_at_epoch_secs = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -61,7 +108,12 @@ pub async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
             Some("load and validate config".to_string()),
         )
         .await;
-    let (config_path_cli, data_path, cli_silent, cli_log_level) = parse_cli();
+    let cli_args = parse_cli();
+    let config_path_cli = cli_args.config_path;
+    let data_path = cli_args.data_path;
+    let cli_silent = cli_args.silent;
+    let cli_log_level = cli_args.log_level;
+    let log_destination = cli_args.log_destination;
     let startup_cwd = match std::env::current_dir() {
         Ok(cwd) => cwd,
         Err(e) => {
@@ -159,17 +211,43 @@ pub async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         )
         .await;
 
-    // Configure color output based on config
-    let fmt_layer = if config.general.disable_colors {
-        fmt::Layer::default().with_ansi(false)
-    } else {
-        fmt::Layer::default().with_ansi(true)
-    };
+    // Initialize logging based on destination
+    let _logging_guard: Option<crate::logging::LoggingGuard>;
+    match log_destination {
+        crate::logging::LogDestination::Stderr => {
+            // Default: log to stderr (works with systemd journald)
+            let fmt_layer = if config.general.disable_colors {
+                fmt::Layer::default().with_ansi(false)
+            } else {
+                fmt::Layer::default().with_ansi(true)
+            };
+            tracing_subscriber::registry()
+                .with(filter_layer)
+                .with(fmt_layer)
+                .init();
+            _logging_guard = None;
+        }
+        #[cfg(unix)]
+        crate::logging::LogDestination::Syslog => {
+            // Syslog: for OpenRC/FreeBSD
+            let logging_opts = crate::logging::LoggingOptions {
+                destination: log_destination,
+                disable_colors: true,
+            };
+            let (_, guard) = crate::logging::init_logging(&logging_opts, "info");
+            _logging_guard = Some(guard);
+        }
+        crate::logging::LogDestination::File { .. } => {
+            // File logging with optional rotation
+            let logging_opts = crate::logging::LoggingOptions {
+                destination: log_destination,
+                disable_colors: true,
+            };
+            let (_, guard) = crate::logging::init_logging(&logging_opts, "info");
+            _logging_guard = Some(guard);
+        }
+    }
 
-    tracing_subscriber::registry()
-        .with(filter_layer)
-        .with(fmt_layer)
-        .init();
     startup_tracker
         .complete_component(
             COMPONENT_TRACING_INIT,
@@ -223,6 +301,7 @@ pub async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         config.general.upstream_connect_retry_attempts,
         config.general.upstream_connect_retry_backoff_ms,
         config.general.upstream_connect_budget_ms,
+        config.general.tg_connect,
         config.general.upstream_unhealthy_fail_threshold,
         config.general.upstream_connect_failfast_hard_errors,
         stats.clone(),
@@ -583,6 +662,14 @@ pub async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         std::process::exit(1);
     }
 
+    // Drop privileges after binding sockets (which may require root for port < 1024)
+    if daemon_opts.user.is_some() || daemon_opts.group.is_some() {
+        if let Err(e) = drop_privileges(daemon_opts.user.as_deref(), daemon_opts.group.as_deref()) {
+            error!(error = %e, "Failed to drop privileges");
+            std::process::exit(1);
+        }
+    }
+
     runtime_tasks::apply_runtime_log_filter(
         has_rust_log,
         &effective_log_level,
@@ -603,6 +690,9 @@ pub async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
 
     runtime_tasks::mark_runtime_ready(&startup_tracker).await;
 
+    // Spawn signal handlers for SIGUSR1/SIGUSR2 (non-shutdown signals)
+    shutdown::spawn_signal_handlers(stats.clone(), process_started_at);
+
     listeners::spawn_tcp_accept_loops(
         listeners,
         config_rx.clone(),
@@ -620,7 +710,7 @@ pub async fn run() -> std::result::Result<(), Box<dyn std::error::Error>> {
         max_connections.clone(),
     );
 
-    shutdown::wait_for_shutdown(process_started_at, me_pool).await;
+    shutdown::wait_for_shutdown(process_started_at, me_pool, stats).await;
 
     Ok(())
 }

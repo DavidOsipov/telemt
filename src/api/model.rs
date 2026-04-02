@@ -428,6 +428,7 @@ pub(super) struct UserLinks {
 #[derive(Serialize)]
 pub(super) struct UserInfo {
     pub(super) username: String,
+    pub(super) in_runtime: bool,
     pub(super) user_ad_tag: Option<String>,
     pub(super) max_tcp_conns: Option<usize>,
     pub(super) expiration_rfc3339: Option<String>,
@@ -443,9 +444,21 @@ pub(super) struct UserInfo {
 }
 
 #[derive(Serialize)]
+pub(super) struct UserActiveIps {
+    pub(super) username: String,
+    pub(super) active_ips: Vec<IpAddr>,
+}
+
+#[derive(Serialize)]
 pub(super) struct CreateUserResponse {
     pub(super) user: UserInfo,
     pub(super) secret: String,
+}
+
+#[derive(Serialize)]
+pub(super) struct DeleteUserResponse {
+    pub(super) username: String,
+    pub(super) in_runtime: bool,
 }
 
 #[derive(Deserialize)]
